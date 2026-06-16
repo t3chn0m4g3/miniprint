@@ -5,8 +5,23 @@ services:
     read_only: true
     container_name: miniprint
     restart: always
+    cpus: "1.0"
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
     ports:
       - "9100:9100"
+      - "80:8080"
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
     volumes:
       - ./log/:/app/log/
       - ./uploads/:/app/uploads/

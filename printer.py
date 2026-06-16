@@ -1,4 +1,4 @@
-'''
+"""
 miniprint - a medium interaction printer honeypot
 Copyright (C) 2019 Dan Salmon - salmon@protonmail.com
 
@@ -6,37 +6,65 @@ This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
+"""
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
+from __future__ import annotations
 
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-'''
-
+import hashlib
+import os
+import posixpath
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
 from pyfakefs import fake_filesystem
-import re
-from datetime import datetime
+
+
+DEFAULT_MAX_JOB_BYTES = 1 * 1024 * 1024
+DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024
+DEFAULT_MAX_VIRTUAL_FILE_BYTES = 256 * 1024
+PJL_FILE_NOT_FOUND = "FILEERROR=3\r\n"
+PJL_BAD_REQUEST = "FILEERROR=2\r\n"
+RESET_SEQUENCE = b"\x1b%-12345X"
+
 
 class Printer:
-    def __init__(self, logger, printer_id="hp LaserJet 4200", code=10001, ready_msg="Ready", online=True):
+    def __init__(
+        self,
+        logger: Any,
+        printer_id: str = "hp LaserJet 4200",
+        code: int = 10001,
+        ready_msg: str = "Ready",
+        online: bool = True,
+        upload_dir: str | os.PathLike[str] = "uploads",
+        max_job_bytes: int = DEFAULT_MAX_JOB_BYTES,
+        max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+        max_virtual_file_bytes: int = DEFAULT_MAX_VIRTUAL_FILE_BYTES,
+    ) -> None:
         self.printer_id = printer_id
         self.code = code
         self.ready_msg = ready_msg
         self.online = online
         self.logger = logger
-        self.rexp = re.compile(r'\s+(\S+)\s+=\s+(?:"([^=]+)"|(\S+))')  # Compile once to decrease match time over multiple uses
+        self.upload_dir = Path(upload_dir)
+        self.max_job_bytes = max_job_bytes
+        self.max_response_bytes = max_response_bytes
+        self.max_virtual_file_bytes = max_virtual_file_bytes
+        self.param_pattern = re.compile(r'(\S+)\s*=\s*(?:"([^"]*)"|(\S+))')
+        self.printing_raw_job = False
+        self.current_raw_print_job = bytearray()
+        self.receiving_postscript = False
+        self.postscript_data = bytearray()
+
+        self.reset_virtual_filesystem()
+
+    def reset_virtual_filesystem(self) -> None:
         self.fs = fake_filesystem.FakeFilesystem()
         self.fos = fake_filesystem.FakeOsModule(self.fs)
-        self.printing_raw_job = False
-        self.current_raw_print_job = ''
-        self.receiving_postscript = False
-        self.postscript_data = ''
+        self._seed_filesystem()
 
-        # Filesystem from HP LaserJet 4200n
+    def _seed_filesystem(self) -> None:
         self.fs.create_dir("/PJL")
         self.fs.create_dir("/PostScript")
         self.fs.create_dir("/saveDevice/SavedJobs/InProgress")
@@ -46,242 +74,473 @@ class Printer:
         self.fs.create_dir("/webServer/lib")
         self.fs.create_dir("/webServer/objects")
         self.fs.create_dir("/webServer/permanent")
-        self.fs.add_real_file(source_path="fake-files/csconfig", read_only=True, target_path="/webServer/default/csconfig")
-        self.fs.add_real_file(source_path="fake-files/device.html", read_only=True, target_path="/webServer/home/device.html")
-        self.fs.add_real_file(source_path="fake-files/hostmanifest", read_only=True, target_path="/webServer/home/hostmanifest")
+        self.fs.add_real_file(
+            source_path="fake-files/csconfig",
+            read_only=True,
+            target_path="/webServer/default/csconfig",
+        )
+        self.fs.add_real_file(
+            source_path="fake-files/device.html",
+            read_only=True,
+            target_path="/webServer/home/device.html",
+        )
+        self.fs.add_real_file(
+            source_path="fake-files/hostmanifest",
+            read_only=True,
+            target_path="/webServer/home/hostmanifest",
+        )
         self.fs.create_file("/webServer/lib/keys")
         self.fs.create_file("/webServer/lib/security")
-    
 
-    def append_raw_print_job(self, text):
-        self.logger.debug(
-            "Appending raw print job",
-            extra={'action': 'append', 'event': 'append_raw_print_job', 'job_text': repr(text.encode('utf-8'))}
-        )
-        self.printing_raw_job = True
-        self.current_raw_print_job += text
+    @staticmethod
+    def _as_text(data: bytes | str) -> str:
+        if isinstance(data, bytes):
+            return data.decode("utf-8", errors="replace")
+        return data
+
+    @staticmethod
+    def _as_bytes(data: bytes | str) -> bytes:
+        if isinstance(data, str):
+            return data.encode("utf-8", errors="replace")
+        return data
+
+    @staticmethod
+    def payload_hash(data: bytes | str) -> str:
+        return hashlib.sha256(Printer._as_bytes(data)).hexdigest()
+
+    @staticmethod
+    def payload_preview(data: bytes | str, limit: int = 96) -> str:
+        raw = Printer._as_bytes(data)[:limit]
+        return raw.decode("utf-8", errors="replace").replace("\r", "\\r").replace("\n", "\\n")
+
+    def _log_payload(self, level: str, message: str, data: bytes | str, **extra: Any) -> None:
+        log_extra = {
+            "payload_sha256": self.payload_hash(data),
+            "payload_preview": self.payload_preview(data),
+            **extra,
+        }
+        getattr(self.logger, level)(message, extra=log_extra)
+
+    def _artifact_name(self, suffix: str, data: bytes) -> str:
+        timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S-%f")
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        return f"{timestamp}_{digest}{suffix}"
+
+    def _save_artifact(self, suffix: str, data: bytes, event: str) -> str | None:
+        if not data:
+            self.logger.info("Nothing to save", extra={"action": "saving", "event": event})
+            return None
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        filename = self._artifact_name(suffix, data)
+        path = self.upload_dir / filename
+        with path.open("wb") as handle:
+            handle.write(data)
         self.logger.info(
-            "Sending empty response",
-            extra={'action': 'response', 'event': 'empty_response'}
+            "Saved print artifact",
+            extra={
+                "action": "saving",
+                "event": event,
+                "file_name": filename,
+                "payload_sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            },
         )
-        return ''
+        return str(path)
 
-
-    def get_parameters(self, command):
-        '''
-            Gets key=value pairs separated by either '=' or ' = '
-            Notes:
-                - Whitespace can be either a space charater or a \t
-                - Whitespace is only required before a key
-                    - Example: Immediately after the D in "@PJL COMMAND a=1"
-                - Whitespace surrounding the equal sign is optional and may be 0 or many characters
-                - String values must be surrounded by double quotes (")
-
-            Valid inputs:
-                @PJL COMMAND a = "b" b=2
-                @PJL COMMAND a = "asf" b = "asdf"
-                @PJL COMMAND a=2 b = "asd"
-                @PJL COMMAND DISPLAY = "rdymsg"
-                @PJL COMMAND DISPLAY = "rdymsg" OTHER = "asdf"
-                @PJL COMMAND A = 1 B = 2
-                @PJL COMMAND    A = 1     B = 2
-                @PJL COMMAND A = 1 B    =   2
-                @PJL COMMAND A=1 B="asdf"\r\nother data
-
-            Invalid inputs:
-                @PJL COMMANDA=1
-        '''
-        request_parameters = {}
-
-        # Get a=b value pairs
-        for x in command.split(" "):
-            if "=" in x and len(x) > 1:
-                key = x.split("=")[0]
-                value = x.split("=")[1]
-
-                if value[0] == '"':  # Handle params like: KEY="VALUE"\r\nsome other data
-                    value = value[0:value[1:].index('"')+2]
-                request_parameters[key] = value
-
-        # Get a = "b" value pairs
-        results = self.rexp.finditer(command)
-        if results is not None:
-            for r in results:
-                key = r.group(1)
-                value = r.group(2) if r.group(2) is not None else r.group(3)
-                if key not in request_parameters:
-                    request_parameters[key] = value
-    
-        return request_parameters
-    
-    
-    def does_path_exist(self, path):
-        return self.fos.path.exists(path)
-        
-    
-    def command_fsdownload(self, request):
-        request_parameters = self.get_parameters(request)
-        file_contents = request[request.index(request_parameters["NAME"])+len(request_parameters["NAME"]):]
-        file_name = request_parameters["NAME"].replace('"', '').split(":")[1]
-        
-        self.logger.debug(
-            "Processing download",
-            extra={'action': 'process', 'event': 'fsdownload', 'file_contents': file_contents}
+    def _response(self, text: str) -> str:
+        encoded = text.encode("utf-8", errors="replace")
+        if len(encoded) <= self.max_response_bytes:
+            return text
+        self.logger.warning(
+            "Response exceeded configured limit",
+            extra={
+                "action": "limit",
+                "event": "response_too_large",
+                "size": len(encoded),
+                "limit": self.max_response_bytes,
+            },
         )
+        return encoded[: self.max_response_bytes].decode("utf-8", errors="replace")
 
-        if file_contents[0:2] == '\r\n':  # Trim leading newline
-            self.logger.debug("Leading newline found", extra={'action': 'process', 'event': 'fsdownload'})
-            file_contents = file_contents[2:]
+    def get_parameters(self, command: bytes | str) -> dict[str, str]:
+        text = self._as_text(command)
+        return {
+            match.group(1).upper(): match.group(2) if match.group(2) is not None else match.group(3)
+            for match in self.param_pattern.finditer(text)
+        }
 
-        if file_contents[-2:] == '\r\n':  # Trim trailing newline
-            self.logger.debug("Trailing newline found", extra={'action': 'process', 'event': 'fsdownload'})
-            file_contents = file_contents[0:-2]
+    def _split_file_payload(self, request: bytes | str) -> tuple[bytes, bytes, dict[str, str], bool]:
+        raw = self._as_bytes(request)
+        header, separator, payload = raw.partition(b"\r\n")
+        parameters = self.get_parameters(header)
+        size = parameters.get("SIZE")
+        if size is not None:
+            try:
+                expected_size = int(size)
+            except ValueError:
+                return header, b"", parameters, False
+            if expected_size < 0:
+                return header, b"", parameters, False
+            payload = payload[:expected_size]
+        elif separator and payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        return header, payload, parameters, True
 
-        # Check if path exists and is file
+    @staticmethod
+    def format_device_name(path: str) -> str:
+        return f'"0:{path}"'
+
+    def normalize_device_path(self, value: str | None) -> str | None:
+        if not value:
+            return None
+        cleaned = value.strip().strip('"')
+        if ":" in cleaned:
+            volume, cleaned = cleaned.split(":", 1)
+            if volume != "0":
+                return None
+        if ".." in cleaned.replace("\\", "/").split("/"):
+            self.logger.warning(
+                "Rejected virtual filesystem path traversal",
+                extra={"action": "reject", "event": "path_traversal", "item": cleaned},
+            )
+            return None
+        cleaned = cleaned.replace("\\", "/")
+        normalized = posixpath.normpath("/" + cleaned.lstrip("/"))
+        if normalized == "/.":
+            return "/"
+        return normalized
+
+    def does_path_exist(self, path: str) -> bool:
+        normalized = self.normalize_device_path(path)
+        return bool(normalized and self.fos.path.exists(normalized))
+
+    def append_raw_print_job(self, data: bytes | str) -> str:
+        raw = self._as_bytes(data)
+        if not raw:
+            return ""
+        self.printing_raw_job = True
+        available = self.max_job_bytes - len(self.current_raw_print_job)
+        if available <= 0:
+            self._log_payload(
+                "warning",
+                "Raw print job exceeded configured limit",
+                raw,
+                action="limit",
+                event="raw_job_too_large",
+                limit=self.max_job_bytes,
+            )
+            return ""
+        if len(raw) > available:
+            self.current_raw_print_job.extend(raw[:available])
+            self._log_payload(
+                "warning",
+                "Truncated raw print job at configured limit",
+                raw,
+                action="limit",
+                event="raw_job_truncated",
+                limit=self.max_job_bytes,
+            )
+            return ""
+        self.current_raw_print_job.extend(raw)
+        self._log_payload(
+            "debug",
+            "Appending raw print job",
+            raw,
+            action="append",
+            event="append_raw_print_job",
+            size=len(raw),
+        )
+        return ""
+
+    def append_postscript(self, data: bytes | str) -> None:
+        raw = self._as_bytes(data)
+        available = self.max_job_bytes - len(self.postscript_data)
+        if available <= 0:
+            self._log_payload(
+                "warning",
+                "PostScript job exceeded configured limit",
+                raw,
+                action="limit",
+                event="postscript_too_large",
+                limit=self.max_job_bytes,
+            )
+            return
+        if len(raw) > available:
+            self.postscript_data.extend(raw[:available])
+            self._log_payload(
+                "warning",
+                "Truncated PostScript job at configured limit",
+                raw,
+                action="limit",
+                event="postscript_truncated",
+                limit=self.max_job_bytes,
+            )
+            return
+        self.postscript_data.extend(raw)
+
+    def command_fsdownload(self, request: bytes | str) -> str:
+        _, file_bytes, request_parameters, payload_valid = self._split_file_payload(request)
+        if not payload_valid:
+            return self._response(f"@PJL FSDOWNLOAD {PJL_BAD_REQUEST}")
+        requested_name = request_parameters.get("NAME")
+        file_name = self.normalize_device_path(requested_name)
+        if not file_name:
+            return self._response(f"@PJL FSDOWNLOAD {PJL_BAD_REQUEST}")
+        if len(file_bytes) > self.max_virtual_file_bytes:
+            self.logger.warning(
+                "Rejected virtual filesystem write above configured limit",
+                extra={
+                    "action": "limit",
+                    "event": "fsdownload_too_large",
+                    "file_name": file_name,
+                    "size": len(file_bytes),
+                    "limit": self.max_virtual_file_bytes,
+                },
+            )
+            return self._response(f"@PJL FSDOWNLOAD NAME={self.format_device_name(file_name)} FILEERROR=1\r\n")
+
+        if self.fos.path.exists(file_name) and self.fos.path.isfile(file_name):
+            self.fos.remove(file_name)
+        try:
+            self.fs.create_file(file_path=file_name, contents=file_bytes)
+        except OSError:
+            self.logger.warning(
+                "Virtual filesystem write failed",
+                extra={"action": "write", "event": "fsdownload_failed", "file_name": file_name},
+            )
+            return self._response(f"@PJL FSDOWNLOAD NAME={self.format_device_name(file_name)} {PJL_FILE_NOT_FOUND}")
+
+        self.logger.info(
+            "Virtual filesystem file written",
+            extra={
+                "action": "write",
+                "event": "fsdownload",
+                "file_name": file_name,
+                "size": len(file_bytes),
+            },
+        )
+        return ""
+
+    def command_fsappend(self, request: bytes | str) -> str:
+        _, payload, request_parameters, payload_valid = self._split_file_payload(request)
+        if not payload_valid:
+            return self._response(f"@PJL FSAPPEND {PJL_BAD_REQUEST}")
+        requested_name = request_parameters.get("NAME")
+        file_name = self.normalize_device_path(requested_name)
+        if not file_name:
+            return self._response(f"@PJL FSAPPEND {PJL_BAD_REQUEST}")
+
+        parent_dir = posixpath.dirname(file_name) or "/"
         if self.fos.path.exists(file_name):
-            a = self.fs.get_object(file_name)
-            if isinstance(a, fake_filesystem.FakeFile) or isinstance(a, fake_filesystem.FakeFileFromRealFile):
-                self.fos.remove(file_name)
+            if not self.fos.path.isfile(file_name):
+                return self._response(f"@PJL FSAPPEND NAME={self.format_device_name(file_name)} {PJL_FILE_NOT_FOUND}")
+            current_size = self.fos.stat(file_name).st_size
+            mode = "ab"
+        elif self.fos.path.isdir(parent_dir):
+            current_size = 0
+            mode = "wb"
+        else:
+            return self._response(f"@PJL FSAPPEND NAME={self.format_device_name(file_name)} {PJL_FILE_NOT_FOUND}")
 
-        self.fs.create_file(file_path=file_name, contents=file_contents)  # TODO: Handle errors if file exists or containing directory doesn't exist
-        self.logger.info("Sending empty response", extra={'action': 'response', 'event': 'fsdownload'})
-        return ''
+        total_size = current_size + len(payload)
+        if total_size > self.max_virtual_file_bytes:
+            self.logger.warning(
+                "Rejected virtual filesystem append above configured limit",
+                extra={
+                    "action": "limit",
+                    "event": "fsappend_too_large",
+                    "file_name": file_name,
+                    "size": len(payload),
+                    "total_size": total_size,
+                    "limit": self.max_virtual_file_bytes,
+                },
+            )
+            return self._response(f"@PJL FSAPPEND NAME={self.format_device_name(file_name)} FILEERROR=1\r\n")
 
+        try:
+            file_module = fake_filesystem.FakeFileOpen(self.fs)
+            with file_module(file_name, mode) as handle:
+                handle.write(payload)
+        except OSError:
+            self.logger.warning(
+                "Virtual filesystem append failed",
+                extra={"action": "append", "event": "fsappend_failed", "file_name": file_name},
+            )
+            return self._response(f"@PJL FSAPPEND NAME={self.format_device_name(file_name)} {PJL_FILE_NOT_FOUND}")
 
-    def command_echo(self, request):
-        self.logger.info("Received request for delimiter", extra={'action': 'request', 'event': 'echo'})
-        response = "@PJL " + request
-        response += '\x1b'
-        self.logger.info("Responding with echo", extra={'action': 'response', 'event': 'echo', 'response': str(response.encode('UTF-8'))})
-        return response
-    
-    
-    def command_fsdirlist(self, request):
+        self.logger.info(
+            "Virtual filesystem file appended",
+            extra={
+                "action": "append",
+                "event": "fsappend",
+                "file_name": file_name,
+                "size": len(payload),
+                "total_size": total_size,
+            },
+        )
+        return ""
+
+    def command_echo(self, request: bytes | str) -> str:
+        text = self._as_text(request)
+        response = "@PJL " + text + "\x1b"
+        self.logger.info("Responding with echo", extra={"action": "response", "event": "echo"})
+        return self._response(response)
+
+    def command_fsdirlist(self, request: bytes | str) -> str:
         request_parameters = self.get_parameters(request)
-        requested_dir = request_parameters["NAME"].replace('"', '').split(":")[1]
-    
-        self.logger.debug("Requested directory listing", extra={'action': 'request', 'event': 'fsdirlist', 'dir': requested_dir})
-        return_entries = ""
-    
-        if self.fos.path.exists(requested_dir):
-            return_entries = ' ENTRY=1\r\n. TYPE=DIR\r\n.. TYPE=DIR'
+        requested_dir = self.normalize_device_path(request_parameters.get("NAME"))
+        if not requested_dir:
+            return self._response(f"@PJL FSDIRLIST {PJL_BAD_REQUEST}")
+
+        self.logger.debug(
+            "Requested directory listing",
+            extra={"action": "request", "event": "fsdirlist", "dir": requested_dir},
+        )
+        if not self.fos.path.exists(requested_dir) or not self.fos.path.isdir(requested_dir):
+            return_entries = "FILEERROR = 3"
+        else:
+            return_entries = " ENTRY=1\r\n. TYPE=DIR\r\n.. TYPE=DIR"
             for entry in self.fos.scandir(requested_dir):
                 if entry.is_file():
-                    size = self.fos.stat(requested_dir + "/" + str(entry.name)).st_size
-                    return_entries += "\r\n" + entry.name + " TYPE=FILE SIZE=" + str(size)
+                    size = self.fos.stat(posixpath.join(requested_dir, str(entry.name))).st_size
+                    return_entries += f"\r\n{entry.name} TYPE=FILE SIZE={size}"
                 elif entry.is_dir():
-                    return_entries += "\r\n" + entry.name + " TYPE=DIR"
-        else:
-            return_entries = "FILEERROR = 3" # "file not found"
-    
-        response = '@PJL FSDIRLIST NAME=' + request_parameters['NAME'] + return_entries
-        self.logger.info("Directory listing response", extra={'action': 'response', 'event': 'fsdirlist', 'response': str(response.encode('UTF-8'))})
-        return response
-        
+                    return_entries += f"\r\n{entry.name} TYPE=DIR"
 
-    def command_fsmkdir(self, request):
+        response = f"@PJL FSDIRLIST NAME={self.format_device_name(requested_dir)}{return_entries}"
+        return self._response(response)
+
+    def command_fsmkdir(self, request: bytes | str) -> str:
         request_parameters = self.get_parameters(request)
-        requested_dir = request_parameters["NAME"].replace('"', '').split(":")[1]
-        self.logger.info("Creating directory", extra={'action': 'request', 'event': 'fsmkdir', 'dir': requested_dir})
-    
+        requested_dir = self.normalize_device_path(request_parameters.get("NAME"))
+        if not requested_dir:
+            return self._response(f"@PJL FSMKDIR {PJL_BAD_REQUEST}")
+
+        self.logger.info(
+            "Creating virtual directory",
+            extra={"action": "request", "event": "fsmkdir", "dir": requested_dir},
+        )
         if not self.fos.path.exists(requested_dir):
             self.fs.create_dir(requested_dir)
-    
-        self.logger.info("Directory created", extra={'action': 'response', 'event': 'fsmkdir'})
-        return ''
-    
-    
-    def command_fsquery(self, request):
+        return ""
+
+    def command_fsdelete(self, request: bytes | str) -> str:
         request_parameters = self.get_parameters(request)
-        requested_item = request_parameters["NAME"].replace('"', '').split(":")[1]
-        self.logger.debug("Requested item", extra={'action': 'request', 'event': 'fsquery', 'item': requested_item})
-        return_data = ''
-    
+        requested_name = self.normalize_device_path(request_parameters.get("NAME"))
+        if not requested_name:
+            return self._response(f"@PJL FSDELETE {PJL_BAD_REQUEST}")
+        if not self.fos.path.exists(requested_name) or not self.fos.path.isfile(requested_name):
+            return self._response(f"@PJL FSDELETE NAME={self.format_device_name(requested_name)} {PJL_FILE_NOT_FOUND}")
+
+        try:
+            self.fos.remove(requested_name)
+        except OSError:
+            self.logger.warning(
+                "Virtual filesystem delete failed",
+                extra={"action": "delete", "event": "fsdelete_failed", "file_name": requested_name},
+            )
+            return self._response(f"@PJL FSDELETE NAME={self.format_device_name(requested_name)} {PJL_FILE_NOT_FOUND}")
+
+        self.logger.info(
+            "Virtual filesystem file deleted",
+            extra={"action": "delete", "event": "fsdelete", "file_name": requested_name},
+        )
+        return ""
+
+    def command_fsinit(self, request: bytes | str) -> str:
+        request_parameters = self.get_parameters(request)
+        volume = request_parameters.get("VOLUME") or request_parameters.get("NAME")
+        if volume and self.normalize_device_path(volume) is None:
+            return self._response(f"@PJL FSINIT {PJL_BAD_REQUEST}")
+
+        self.reset_virtual_filesystem()
+        self.logger.info(
+            "Virtual filesystem initialized",
+            extra={"action": "init", "event": "fsinit", "volume": volume or "0:"},
+        )
+        return ""
+
+    def command_fsquery(self, request: bytes | str) -> str:
+        request_parameters = self.get_parameters(request)
+        requested_item = self.normalize_device_path(request_parameters.get("NAME"))
+        if not requested_item:
+            return self._response(f"@PJL FSQUERY {PJL_BAD_REQUEST}")
+
         if self.fos.path.exists(requested_item):
             if self.fos.path.isfile(requested_item):
                 size = self.fos.stat(requested_item).st_size
-                return_data = "NAME=" + request_parameters["NAME"] + " TYPE=FILE SIZE=" + str(size)
+                return_data = f"NAME={self.format_device_name(requested_item)} TYPE=FILE SIZE={size}"
             elif self.fos.path.isdir(requested_item):
-                return_data = "NAME=" + request_parameters["NAME"] + " TYPE=DIR"
+                return_data = f"NAME={self.format_device_name(requested_item)} TYPE=DIR"
+            else:
+                return_data = f"NAME={self.format_device_name(requested_item)} TYPE=UNKNOWN"
         else:
-            return_data = "NAME=" + request_parameters["NAME"] + " FILEERROR=3\r\n" # File not found
-    
-        response = '@PJL FSQUERY ' + return_data
-        self.logger.info("FSQUERY response", extra={'action': 'response', 'event': 'fsquery', 'response': str(return_data.encode('UTF-8'))})
-        return response
-    
+            return_data = f"NAME={self.format_device_name(requested_item)} {PJL_FILE_NOT_FOUND}"
+        return self._response("@PJL FSQUERY " + return_data)
 
-    def command_fsupload(self, request):
+    def command_fsupload(self, request: bytes | str) -> str:
         request_parameters = self.get_parameters(request)
-        upload_file = request_parameters["NAME"].replace('"', '').split(":")[1]
-        self.logger.info("Upload file", extra={'action': 'request', 'event': 'fsupload', 'upload_file': upload_file})
-        return_data = ''
+        upload_file = self.normalize_device_path(request_parameters.get("NAME"))
+        if not upload_file:
+            return self._response(f"@PJL FSUPLOAD {PJL_BAD_REQUEST}")
 
-        if self.fos.path.exists(upload_file):
-            contents = ''
+        self.logger.info(
+            "Virtual file requested",
+            extra={"action": "request", "event": "fsupload", "upload_file": upload_file},
+        )
+        if self.fos.path.exists(upload_file) and self.fos.path.isfile(upload_file):
             file_module = fake_filesystem.FakeFileOpen(self.fs)
-            for line in file_module(upload_file):
-                contents += line
-
+            with file_module(upload_file, "r") as handle:
+                contents = handle.read()
             size = self.fos.stat(upload_file).st_size
-            return_data = 'FORMAT:BINARY NAME=' + request_parameters['NAME'] + ' OFFSET=0 SIZE=' + str(size) + '\r\n' + contents
+            return_data = (
+                f"FORMAT:BINARY NAME={self.format_device_name(upload_file)} "
+                f"OFFSET=0 SIZE={size}\r\n{contents}"
+            )
         else:
-            return_data = 'NAME=' + request_parameters['NAME'] + '\r\nFILEERROR=3\r\n'
+            return_data = f"NAME={self.format_device_name(upload_file)}\r\n{PJL_FILE_NOT_FOUND}"
+        return self._response("@PJL FSUPLOAD " + return_data)
 
-        response = '@PJL FSUPLOAD ' + return_data
-        self.logger.info("Upload response", extra={'action': 'response', 'event': 'fsupload', 'response': str(response.encode('UTF-8'))})
-        return response
+    def command_info_id(self, request: bytes | str) -> str:
+        del request
+        response = f"@PJL INFO ID\r\n{self.printer_id}\r\n\x1b"
+        return self._response(response)
 
-    
-    def command_info_id(self, request):
-        self.logger.info("ID requested", extra={'action': 'request', 'event': 'info_id'})
-        response = '@PJL INFO ID\r\n' + self.printer_id + '\r\n\x1b'
-        self.logger.info("ID response", extra={'action': 'response', 'event': 'info_id', 'response': str(response.encode('UTF-8'))})
-        return response
-        
+    def command_info_status(self, request: bytes | str) -> str:
+        del request
+        response = (
+            f"@PJL INFO STATUS\r\nCODE={self.code}\r\n"
+            f'DISPLAY="{self.ready_msg}"\r\nONLINE={self.online}'
+        )
+        return self._response(response)
 
-    def command_info_status(self, request):
-        self.logger.info("Client requests status", extra={'action': 'request', 'event': 'info_status'})
-        response = '@PJL INFO STATUS\r\nCODE=' + str(self.code) + '\r\nDISPLAY="' + self.ready_msg + '"\r\nONLINE=' + str(self.online)
-        self.logger.info("Status response", extra={'action': 'response', 'event': 'info_status', 'response': str(response.encode('UTF-8'))})
-        return response
-
-
-    def command_rdymsg(self, request):
+    def command_rdymsg(self, request: bytes | str) -> str:
         request_parameters = self.get_parameters(request)
-        rdymsg = request_parameters["DISPLAY"]
-        self.logger.info("Ready message", extra={'action': 'request', 'event': 'rdymsg', 'rdymsg': str(rdymsg.encode('UTF-8'))})
+        rdymsg = request_parameters.get("DISPLAY")
+        if rdymsg is None:
+            return self._response(f"@PJL RDYMSG {PJL_BAD_REQUEST}")
+        self.ready_msg = rdymsg
+        self.logger.info(
+            "Ready message changed",
+            extra={"action": "request", "event": "rdymsg", "rdymsg": self.ready_msg},
+        )
+        return ""
 
-        self.ready_msg = rdymsg.replace('"', '')
-        self.logger.info("Ready message response", extra={'action': 'response', 'event': 'rdymsg'})
-        return ''
+    def command_ustatusoff(self, request: bytes | str) -> str:
+        del request
+        self.logger.info("Status updates disabled", extra={"action": "request", "event": "ustatusoff"})
+        return ""
 
+    def save_postscript(self) -> str | None:
+        data = bytes(self.postscript_data)
+        artifact = self._save_artifact(".ps", data, "save_postscript")
+        self.postscript_data.clear()
+        self.receiving_postscript = False
+        return artifact
 
-    def command_ustatusoff(self, request):
-        self.logger.info("Request received", extra={'action': 'request', 'event': 'ustatusoff'})
-        self.logger.info("Sending empty reply", extra={'action': 'response', 'event': 'ustatusoff'})
-        return ''
-            
-
-    def save_postscript(self):
-        file_name = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S-%f") + ".ps"
-        if self.receiving_postscript:
-            self.logger.info("Saving postscript file", extra={'action': 'saving', 'event': 'save_postscript', 'file_name': file_name})
-            with open("./uploads/" + file_name, 'w') as f:
-                f.write(self.postscript_data)
-            self.postscript_data = ''
-            self.receiving_postscript = False
-        else:
-            self.logger.info("Nothing to save", extra={'action': 'saving', 'event': 'save_postscript'})
-
-
-    def save_raw_print_job(self):
-        file_name = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S-%f") + ".txt"
-        if self.current_raw_print_job:
-            self.logger.info("Saving raw print job", extra={'action': 'saving', 'event': 'save_raw_print_job', 'file_name': file_name})
-            with open("./uploads/" + file_name, 'w') as f:
-                f.write(self.current_raw_print_job)
-            self.current_raw_print_job = ''
-            self.printing_raw_job = False
-        else:
-            self.logger.info("Nothing to save", extra={'action': 'saving', 'event': 'save_raw_print_job'})
+    def save_raw_print_job(self) -> str | None:
+        data = bytes(self.current_raw_print_job)
+        artifact = self._save_artifact(".txt", data, "save_raw_print_job")
+        self.current_raw_print_job.clear()
+        self.printing_raw_job = False
+        return artifact

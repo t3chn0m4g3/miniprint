@@ -1,3 +1,0 @@
-pyfakefs
-pytest-xdist
-argparse
