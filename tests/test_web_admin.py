@@ -162,18 +162,19 @@ class WebAdminTestCase(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIn("Authentication Required", body)
         self.assertIn("ssrf_probe", self.events())
-        self.assertIn("CVE-2025-9269", self.hints())
+        self.assertNotIn("CVE-2025-9269", self.hints())
+        self.assertNotIn("CVE-2024-51980", self.hints())
 
     def test_path_traversal_probe_is_logged(self) -> None:
         status, body = self.request("/../../etc/passwd")
         self.assertEqual(status, 404)
         self.assertIn("Not Found", body)
         self.assertIn("path_traversal_probe", self.events())
-        self.assertIn("CVE-2025-1127", self.hints())
+        self.assertNotIn("CVE-2025-1127", self.hints())
 
     def test_postscript_firmware_probe_is_logged(self) -> None:
         status, body = self.request("/firmware/update", data=b"%!PS\nsetpagedevice", method="POST")
         self.assertEqual(status, 202)
         self.assertIn("queued", body)
         self.assertIn("firmware_probe", self.events())
-        self.assertIn("CVE-2025-65079..65081", self.hints())
+        self.assertNotIn("CVE-2025-65079..65081", self.hints())

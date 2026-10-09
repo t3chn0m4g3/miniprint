@@ -28,12 +28,12 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY . .
-RUN mkdir -p /app/log /app/uploads \
-    && chown -R miniprint:miniprint /app/log /app/uploads
+RUN mkdir -p /app/log /app/uploads /app/data \
+    && chown -R miniprint:miniprint /app/log /app/uploads /app/data
 
 USER miniprint
 
-EXPOSE 9100 8080
+EXPOSE 9100 80
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD MINIPRINT_HEALTHCHECK=1 /app/.venv/bin/python ./server.py || exit 1

@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from pyfakefs import fake_filesystem
+from device_state import DeviceState
+from personas import Persona, Identity, PERSONAS, new_identity
 
 
 DEFAULT_MAX_JOB_BYTES = 1 * 1024 * 1024
@@ -41,10 +43,15 @@ class Printer:
         max_job_bytes: int = DEFAULT_MAX_JOB_BYTES,
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         max_virtual_file_bytes: int = DEFAULT_MAX_VIRTUAL_FILE_BYTES,
+        persona: Persona | None = None,
+        identity: Identity | None = None,
+        device: DeviceState | None = None,
     ) -> None:
-        self.printer_id = printer_id
+        self.persona = persona or PERSONAS["hp"]
+        self.identity = identity or new_identity(self.persona.name)
+        self.device = device or DeviceState(ready_msg=ready_msg)
+        self.printer_id = self.persona.pjl_id if persona is not None else printer_id
         self.code = code
-        self.ready_msg = ready_msg
         self.online = online
         self.logger = logger
         self.upload_dir = Path(upload_dir)
@@ -57,10 +64,24 @@ class Printer:
         self.receiving_postscript = False
         self.postscript_data = bytearray()
 
-        self.reset_virtual_filesystem()
+        with self.device.lock:
+            if self.device.fs is None:
+                self.reset_virtual_filesystem()
+            else:
+                self.fs = self.device.fs
+                self.fos = fake_filesystem.FakeOsModule(self.fs)
+
+    @property
+    def ready_msg(self) -> str:
+        return self.device.ready_msg
+
+    @ready_msg.setter
+    def ready_msg(self, value: str):
+        self.device.ready_msg = value
 
     def reset_virtual_filesystem(self) -> None:
         self.fs = fake_filesystem.FakeFilesystem()
+        self.device.fs = self.fs
         self.fos = fake_filesystem.FakeOsModule(self.fs)
         self._seed_filesystem()
 
@@ -74,21 +95,15 @@ class Printer:
         self.fs.create_dir("/webServer/lib")
         self.fs.create_dir("/webServer/objects")
         self.fs.create_dir("/webServer/permanent")
-        self.fs.add_real_file(
-            source_path="fake-files/csconfig",
-            read_only=True,
-            target_path="/webServer/default/csconfig",
-        )
-        self.fs.add_real_file(
-            source_path="fake-files/device.html",
-            read_only=True,
-            target_path="/webServer/home/device.html",
-        )
-        self.fs.add_real_file(
-            source_path="fake-files/hostmanifest",
-            read_only=True,
-            target_path="/webServer/home/hostmanifest",
-        )
+        for filename, target in (
+            ("csconfig", "/webServer/default/csconfig"),
+            ("device.html", "/webServer/home/device.html"),
+            ("hostmanifest", "/webServer/home/hostmanifest"),
+        ):
+            template = (self.persona.seed_dir / filename).read_text()
+            content = template.replace("{serial}", self.identity.serial).replace("{hostname}", self.identity.hostname)
+            content = content.replace("{firmware}", self.identity.firmware)
+            self.fs.create_file(target, contents=content)
         self.fs.create_file("/webServer/lib/keys")
         self.fs.create_file("/webServer/lib/security")
 
@@ -204,7 +219,7 @@ class Printer:
         if ".." in cleaned.replace("\\", "/").split("/"):
             self.logger.warning(
                 "Rejected virtual filesystem path traversal",
-                extra={"action": "reject", "event": "path_traversal", "item": cleaned},
+                extra={"action": "reject", "event": "path_traversal", "virtual_path": cleaned},
             )
             return None
         cleaned = cleaned.replace("\\", "/")
@@ -295,7 +310,7 @@ class Printer:
                 extra={
                     "action": "limit",
                     "event": "fsdownload_too_large",
-                    "file_name": file_name,
+                    "virtual_path": file_name,
                     "size": len(file_bytes),
                     "limit": self.max_virtual_file_bytes,
                 },
@@ -309,7 +324,7 @@ class Printer:
         except OSError:
             self.logger.warning(
                 "Virtual filesystem write failed",
-                extra={"action": "write", "event": "fsdownload_failed", "file_name": file_name},
+                extra={"action": "write", "event": "fsdownload_failed", "virtual_path": file_name},
             )
             return self._response(f"@PJL FSDOWNLOAD NAME={self.format_device_name(file_name)} {PJL_FILE_NOT_FOUND}")
 
@@ -318,7 +333,7 @@ class Printer:
             extra={
                 "action": "write",
                 "event": "fsdownload",
-                "file_name": file_name,
+                "virtual_path": file_name,
                 "size": len(file_bytes),
             },
         )
@@ -352,7 +367,7 @@ class Printer:
                 extra={
                     "action": "limit",
                     "event": "fsappend_too_large",
-                    "file_name": file_name,
+                    "virtual_path": file_name,
                     "size": len(payload),
                     "total_size": total_size,
                     "limit": self.max_virtual_file_bytes,
@@ -367,7 +382,7 @@ class Printer:
         except OSError:
             self.logger.warning(
                 "Virtual filesystem append failed",
-                extra={"action": "append", "event": "fsappend_failed", "file_name": file_name},
+                extra={"action": "append", "event": "fsappend_failed", "virtual_path": file_name},
             )
             return self._response(f"@PJL FSAPPEND NAME={self.format_device_name(file_name)} {PJL_FILE_NOT_FOUND}")
 
@@ -376,7 +391,7 @@ class Printer:
             extra={
                 "action": "append",
                 "event": "fsappend",
-                "file_name": file_name,
+                "virtual_path": file_name,
                 "size": len(payload),
                 "total_size": total_size,
             },
@@ -385,7 +400,7 @@ class Printer:
 
     def command_echo(self, request: bytes | str) -> bytes:
         text = self._as_text(request)
-        response = "@PJL " + text + "\x1b"
+        response = "@PJL " + text.rstrip("\r\n") + "\r\n\x0c"
         self.logger.info("Responding with echo", extra={"action": "response", "event": "echo"})
         return self._response(response)
 
@@ -397,7 +412,7 @@ class Printer:
 
         self.logger.debug(
             "Requested directory listing",
-            extra={"action": "request", "event": "fsdirlist", "dir": requested_dir},
+            extra={"action": "request", "event": "fsdirlist", "virtual_path": requested_dir},
         )
         if not self.fos.path.exists(requested_dir) or not self.fos.path.isdir(requested_dir):
             return_entries = "FILEERROR = 3"
@@ -421,7 +436,7 @@ class Printer:
 
         self.logger.info(
             "Creating virtual directory",
-            extra={"action": "request", "event": "fsmkdir", "dir": requested_dir},
+            extra={"action": "request", "event": "fsmkdir", "virtual_path": requested_dir},
         )
         if not self.fos.path.exists(requested_dir):
             self.fs.create_dir(requested_dir)
@@ -440,13 +455,13 @@ class Printer:
         except OSError:
             self.logger.warning(
                 "Virtual filesystem delete failed",
-                extra={"action": "delete", "event": "fsdelete_failed", "file_name": requested_name},
+                extra={"action": "delete", "event": "fsdelete_failed", "virtual_path": requested_name},
             )
             return self._response(f"@PJL FSDELETE NAME={self.format_device_name(requested_name)} {PJL_FILE_NOT_FOUND}")
 
         self.logger.info(
             "Virtual filesystem file deleted",
-            extra={"action": "delete", "event": "fsdelete", "file_name": requested_name},
+            extra={"action": "delete", "event": "fsdelete", "virtual_path": requested_name},
         )
         return b""
 
@@ -489,7 +504,7 @@ class Printer:
 
         self.logger.info(
             "Virtual file requested",
-            extra={"action": "request", "event": "fsupload", "upload_file": upload_file},
+            extra={"action": "request", "event": "fsupload", "virtual_path": upload_file},
         )
         if self.fos.path.exists(upload_file) and self.fos.path.isfile(upload_file):
             file_module = fake_filesystem.FakeFileOpen(self.fs)
@@ -516,13 +531,53 @@ class Printer:
 
     def command_info_id(self, request: bytes | str) -> bytes:
         del request
-        response = f"@PJL INFO ID\r\n{self.printer_id}\r\n\x1b"
+        response = f"@PJL INFO ID\r\n{self.printer_id}\r\n\x0c"
         return self._response(response)
 
     def command_info_status(self, request: bytes | str) -> bytes:
         del request
-        response = f'@PJL INFO STATUS\r\nCODE={self.code}\r\nDISPLAY="{self.ready_msg}"\r\nONLINE={self.online}'
+        response = f'@PJL INFO STATUS\r\nCODE={self.code}\r\nDISPLAY="{self.ready_msg}"\r\nONLINE={str(self.online).upper()}\r\n\x0c'
         return self._response(response)
+
+    def command_info(self, request: bytes | str) -> bytes:
+        text = self._as_text(request).strip().upper()
+        family = text.split()[-1]
+        if family == "ID":
+            return self.command_info_id(request)
+        if family == "STATUS":
+            return self.command_info_status(request)
+        if family == "VARIABLES":
+            value = "\r\n".join(f"{key}={value}" for key, value in self.device.variables.items())
+        else:
+            value = self.persona.info(family, self.identity)
+        return self._response(f"@PJL INFO {family}\r\n{value}\r\n\x0c")
+
+    def command_variable(self, request: bytes | str) -> bytes:
+        text = self._as_text(request).strip()
+        command, _, value = text.partition(" ")
+        command = command.upper()
+        if command in ("INQUIRE", "DINQUIRE"):
+            store = self.device.defaults if command == "DINQUIRE" else self.device.variables
+            return self._response(f"@PJL {command} {value.upper()}\r\n{store.get(value.upper(), '?')}\r\n\x0c")
+        params = self.get_parameters(value)
+        for key, val in params.items():
+            self.device.variables[key] = val
+            if command == "DEFAULT":
+                self.device.defaults[key] = val
+        self.logger.info(
+            "PJL variable updated", extra={"event": "variable_set", "command": command, "variable": ",".join(params)}
+        )
+        return b""
+
+    def command_job(self, request: bytes | str) -> bytes:
+        command = self._as_text(request).split()[0].upper()
+        self.logger.info("Job boundary observed", extra={"event": "job_boundary", "command": command})
+        return b""
+
+    def command_rnvram(self, request: bytes | str) -> bytes:
+        del request
+        self.logger.info("NVRAM requested", extra={"event": "rnvram"})
+        return self._response(b"@PJL RNVRAM\r\n\x00\x01\x00\x00\r\n\x0c")
 
     def command_rdymsg(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)

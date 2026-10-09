@@ -36,7 +36,7 @@ class PrinterTestCase(unittest.TestCase):
 
     def test_echo(self) -> None:
         response = self.printer.command_echo("ECHO DELIMITER20687")
-        self.assertEqual(response, b"@PJL ECHO DELIMITER20687\x1b")
+        self.assertEqual(response, b"@PJL ECHO DELIMITER20687\r\n\x0c")
 
     def test_fsdownload_and_query(self) -> None:
         command = (
@@ -159,10 +159,10 @@ class PrinterTestCase(unittest.TestCase):
         self.assertEqual(params["C"], "quoted value")
 
     def test_info_commands(self) -> None:
-        self.assertEqual(self.printer.command_info_id(b""), b"@PJL INFO ID\r\nhp LaserJet 4200\r\n\x1b")
+        self.assertEqual(self.printer.command_info_id(b""), b"@PJL INFO ID\r\nhp LaserJet 4200\r\n\x0c")
         self.assertEqual(
             self.printer.command_info_status(b""),
-            b'@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY="Ready"\r\nONLINE=True',
+            b'@PJL INFO STATUS\r\nCODE=10001\r\nDISPLAY="Ready"\r\nONLINE=TRUE\r\n\x0c',
         )
 
     def test_postscript_job_saved_as_binary_artifact(self) -> None:

@@ -14,29 +14,11 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from connection_limits import ConnectionLimitedMixIn
 from telemetry import ContextLoggerAdapter, format_utc
+from personas import PERSONAS, Identity, new_identity
+from device_state import DeviceStateStore
 
 
-DEVICE_PROFILE = {
-    "manufacturer": "Brother",
-    "model": "MFC-L9570CDW",
-    "serial": "E78321M4N957143",
-    "firmware": "ZP-1.59.2024",
-    "location": "Accounting 2F",
-    "hostname": "BRN957143",
-}
 SSRF_PARAMETERS = {"url", "uri", "target", "server", "dest", "callback", "address", "host"}
-LOGIN_PATHS = {"/login", "/admin/login", "/general/login.html", "/web/admin/login"}
-INFO_PATHS = {
-    "/",
-    "/status",
-    "/device",
-    "/deviceinfo",
-    "/deviceinfo.xml",
-    "/general/status.html",
-    "/web/general/status.html",
-}
-ADMIN_PATHS = {"/admin", "/admin/config", "/web/admin/config", "/network/config"}
-FIRMWARE_PATHS = {"/firmware", "/firmware/update", "/admin/firmware", "/web/admin/firmware"}
 
 
 class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
@@ -53,8 +35,34 @@ class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
         max_connections: int = 16,
         connection_slots: threading.BoundedSemaphore | None = None,
         handler_timeout: float = 15,
+        identity: Identity | None = None,
+        device_store: DeviceStateStore | None = None,
+        uploads_dir: str = "uploads",
+        max_job_bytes: int = 1048576,
     ) -> None:
-        self.logger = logger
+        self.identity = identity or new_identity("brother")
+        self.persona = PERSONAS[self.identity.persona]
+        self.profile = self.identity.profile()
+        self.info_paths = {
+            "/",
+            "/status",
+            "/device",
+            "/deviceinfo",
+            "/deviceinfo.xml",
+            self.persona.status_path.split("?", 1)[0],
+        }
+        self.login_paths = {"/login", "/admin/login", self.persona.login_path}
+        self.admin_paths = {"/admin", "/admin/config", "/network/config"}
+        self.firmware_paths = {
+            "/firmware",
+            "/firmware/update",
+            "/admin/firmware",
+            self.persona.admin_prefix + "/firmware",
+        }
+        self.device_store = device_store or DeviceStateStore()
+        self.uploads_dir = uploads_dir
+        self.max_job_bytes = max_job_bytes
+        self.logger = ContextLoggerAdapter(logger, {"persona": self.persona.name})
         self.max_request_bytes = max_request_bytes
         self.handler_timeout = handler_timeout
         self.connection_slots = (
@@ -64,8 +72,30 @@ class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
 
 
 class WebAdminHandler(BaseHTTPRequestHandler):
-    server_version = "Debut/1.30"
+    protocol_version = "HTTP/1.1"
+    server_version = ""
     sys_version = ""
+
+    def version_string(self) -> str:
+        return self.server.persona.banner
+
+    def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+        del explain
+        self.close_connection = True
+        self._send_html(
+            HTTPStatus(code),
+            self._not_found_page(message or HTTPStatus(code).phrase),
+            head_only=getattr(self, "command", None) == "HEAD",
+        )
+
+    def do_OPTIONS(self) -> None:
+        self._send_response(HTTPStatus.OK, b"", "text/html", extra_headers={"Allow": "GET, HEAD, POST, PUT, OPTIONS"})
+
+    def do_DELETE(self) -> None:
+        self.send_error(405)
+
+    def do_PATCH(self) -> None:
+        self.send_error(405)
 
     def setup(self) -> None:
         self.timeout = self.server.handler_timeout
@@ -89,11 +119,20 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         )
 
     def handle_one_request(self) -> None:
+        self.request_completed = False
         try:
             super().handle_one_request()
+        except Exception as exc:
+            self.close_connection = True
+            self.log.warning("HTTP request failed", extra={"event": "http_error", "error_type": type(exc).__name__})
         finally:
             if getattr(self, "raw_requestline", b""):
                 self.request_seen = True
+                if not self.request_completed:
+                    self.log.info(
+                        "HTTP request completed",
+                        extra={"event": "http_request_completed", "action": "request_completed"},
+                    )
 
     def finish(self) -> None:
         try:
@@ -135,6 +174,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         except ValueError:
             content_length = 0
         if content_length > self.server.max_request_bytes:
+            self.close_connection = True
             self.log.warning(
                 "HTTP body exceeded configured limit",
                 extra={
@@ -170,11 +210,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         self.log.info("HTTP request received", extra=request_extra)
 
         try:
-            if path in LOGIN_PATHS:
+            if path in self.server.login_paths and (path not in self.server.info_paths or self.command == "POST"):
                 self._handle_login(body_params, head_only)
-            elif path in ADMIN_PATHS:
+            elif path in self.server.admin_paths or (
+                path.startswith(self.server.persona.admin_prefix + "/") and path not in self.server.info_paths
+            ):
                 self._send_html(HTTPStatus.UNAUTHORIZED, self._admin_page(), head_only=head_only)
-            elif path in FIRMWARE_PATHS:
+            elif path in self.server.firmware_paths:
                 self._send_json(
                     HTTPStatus.ACCEPTED,
                     {"status": "queued", "message": "Firmware image received for validation"},
@@ -182,11 +224,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 )
             elif path.endswith(".xml") or path == "/deviceinfo.xml":
                 self._send_xml(HTTPStatus.OK, self._device_xml(), head_only=head_only)
-            elif path in INFO_PATHS or path == "/":
+            elif path in self.server.info_paths or path in ("/", self.server.persona.status_path.split("?", 1)[0]):
                 self._send_html(HTTPStatus.OK, self._status_page(), head_only=head_only)
             else:
                 self._send_html(HTTPStatus.NOT_FOUND, self._not_found_page(path), head_only=head_only)
         finally:
+            self.request_completed = True
             self.log.info(
                 "HTTP request completed",
                 extra={"action": "request_completed", "event": "http_request_completed"},
@@ -212,23 +255,26 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         lower_path = path.lower()
         lower_body = body_text.lower()
         if ".." in lower_path or "%2e" in self.path.lower():
-            hints.append("CVE-2025-1127")
+            hints.extend(self._hint("path_traversal_probe"))
             event = "path_traversal_probe"
         if self._has_ssrf_probe(query) or self._has_ssrf_probe(body_params):
-            hints.extend(["CVE-2024-51980", "CVE-2024-51981", "CVE-2025-9269"])
+            hints.extend(self._hint("ssrf_probe"))
             event = "ssrf_probe"
-        if path in LOGIN_PATHS:
-            hints.append("CVE-2024-51978")
+        if path in self.server.login_paths:
+            hints.extend(self._hint("default_password_probe"))
             event = "login_probe"
-        if path in INFO_PATHS or "serial" in lower_path or "deviceinfo" in lower_path:
-            hints.append("CVE-2024-51977")
+        if path in self.server.info_paths or "serial" in lower_path or "deviceinfo" in lower_path:
+            hints.extend(self._hint("serial_leak_probe"))
             event = "device_info_probe"
         if "%!ps" in lower_body or "%!" in lower_body or "setpagedevice" in lower_body:
-            hints.append("CVE-2025-65079..65081")
             event = "postscript_probe"
-        if path in FIRMWARE_PATHS or "firmware" in lower_path:
+        if path in self.server.firmware_paths or "firmware" in lower_path:
             event = "firmware_probe"
         return list(dict.fromkeys(hints)), event
+
+    def _hint(self, event: str) -> list[str]:
+        hint = self.server.persona.cve_hints.get(event)
+        return [hint] if hint else []
 
     @staticmethod
     def _has_ssrf_probe(params: dict[str, list[str]]) -> bool:
@@ -257,7 +303,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 else "login_attempt",
                 "username": username[:64],
                 "secret_supplied": secret_supplied,
-                "cve_hint": "CVE-2024-51978",
+                "cve_hint": self.server.persona.cve_hints.get("default_password_probe"),
             },
         )
         self._send_html(HTTPStatus.UNAUTHORIZED, self._login_page(failed=bool(username)), head_only=head_only)
@@ -279,9 +325,17 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     def _send_html(self, status: HTTPStatus, text: str, head_only: bool = False) -> None:
         self._send_response(status, text.encode("utf-8"), "text/html; charset=utf-8", head_only=head_only)
 
-    def _send_response(self, status: HTTPStatus, body: bytes, content_type: str, head_only: bool = False) -> None:
+    def _send_response(
+        self,
+        status: HTTPStatus,
+        body: bytes,
+        content_type: str,
+        head_only: bool = False,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status.value)
-        self.send_header("Server", "Debut/1.30")
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -291,12 +345,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(body)
 
-    @staticmethod
-    def _status_page() -> str:
-        escaped = {key: html.escape(value) for key, value in DEVICE_PROFILE.items()}
+    def _status_page(self) -> str:
+        escaped = {key: html.escape(value) for key, value in self.server.profile.items()}
         return f"""<!doctype html>
 <html lang="en">
-<head><title>{escaped["model"]}</title></head>
+<head><title>{html.escape(self.server.persona.title)}</title></head>
 <body>
 <h1>{escaped["manufacturer"]} {escaped["model"]}</h1>
 <dl>
@@ -314,11 +367,10 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 </body>
 </html>"""
 
-    @staticmethod
-    def _login_page(failed: bool = False) -> str:
+    def _login_page(self, failed: bool = False) -> str:
         message = "<p>Authentication failed.</p>" if failed else ""
         return f"""<!doctype html>
-<html lang="en"><head><title>Printer Login</title></head>
+<html lang="en"><head><title>{html.escape(self.server.persona.title)} Login</title></head>
 <body><h1>Printer Web Based Management</h1>{message}
 <form method="post" action="/login">
 <label>User <input name="username"></label>
@@ -326,21 +378,18 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 <button type="submit">Log in</button>
 </form></body></html>"""
 
-    @staticmethod
-    def _admin_page() -> str:
-        return """<!doctype html>
-<html lang="en"><head><title>Authentication Required</title></head>
+    def _admin_page(self) -> str:
+        return f"""<!doctype html>
+<html lang="en"><head><title>{html.escape(self.server.persona.title)}</title></head>
 <body><h1>Authentication Required</h1></body></html>"""
 
-    @staticmethod
-    def _not_found_page(path: str) -> str:
+    def _not_found_page(self, path: str) -> str:
         return f"""<!doctype html>
-<html lang="en"><head><title>Not Found</title></head>
+<html lang="en"><head><title>{html.escape(self.server.persona.title)}</title></head>
 <body><h1>Not Found</h1><p>{html.escape(path)}</p></body></html>"""
 
-    @staticmethod
-    def _device_xml() -> str:
-        escaped = {key: html.escape(value) for key, value in DEVICE_PROFILE.items()}
+    def _device_xml(self) -> str:
+        escaped = {key: html.escape(value) for key, value in self.server.profile.items()}
         return f"""<?xml version="1.0" encoding="utf-8"?>
 <DeviceInfo>
   <Manufacturer>{escaped["manufacturer"]}</Manufacturer>
@@ -359,6 +408,10 @@ def create_http_server(
     max_connections: int = 16,
     connection_slots: threading.BoundedSemaphore | None = None,
     handler_timeout: float = 15,
+    identity: Identity | None = None,
+    device_store: DeviceStateStore | None = None,
+    uploads_dir: str = "uploads",
+    max_job_bytes: int = 1048576,
 ) -> WebAdminServer:
     return WebAdminServer(
         address,
@@ -368,4 +421,8 @@ def create_http_server(
         max_connections=max_connections,
         connection_slots=connection_slots,
         handler_timeout=handler_timeout,
+        identity=identity,
+        device_store=device_store,
+        uploads_dir=uploads_dir,
+        max_job_bytes=max_job_bytes,
     )

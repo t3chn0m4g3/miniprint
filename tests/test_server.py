@@ -62,6 +62,8 @@ class ServerTestCase(unittest.TestCase):
             "pjl_port": 0,
             "http_enabled": False,
             "uploads_dir": self.tmpdir.name,
+            "state_dir": self.tmpdir.name,
+            "persona": "hp",
             "timeout": 1,
         }
         config_values.update(overrides)
@@ -183,6 +185,17 @@ class ServerTestCase(unittest.TestCase):
         )
         self.assertIn(b"SIZE=10\r\n0123456789", response)
         self.assertTrue(response.endswith(b"0123456789"))
+
+    def test_reconnect_preserves_fs_variables_and_ready_message(self) -> None:
+        address = self.start_server()
+        self.exchange(
+            address, b'@PJL FSAPPEND SIZE=3 NAME="0:/persist"\nabc@PJL SET COPIES=7\n@PJL RDYMSG DISPLAY="Busy"\n'
+        )
+        response = self.exchange(address, b'@PJL FSQUERY NAME="0:/persist"\n@PJL INQUIRE COPIES\n@PJL INFO STATUS\n')
+        self.assertIn(b"TYPE=FILE SIZE=3", response)
+        self.assertIn(b"COPIES\r\n7", response)
+        self.assertIn(b'DISPLAY="Busy"', response)
+        self.assertTrue(all(record.persona == "hp" for record in self.handler.records))
 
     def test_parse_commands_preserves_raw_segments(self) -> None:
         commands = PJLRequestHandler.parse_commands(b"hello@PJL INFO ID\r\n@PJL USTATUSOFF\r\n")

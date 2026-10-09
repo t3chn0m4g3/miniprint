@@ -9,3 +9,5 @@ uploads/*
 !uploads/.gitkeep
 log/*
 !log/.gitkeep
+
+data/

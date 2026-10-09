@@ -19,9 +19,12 @@ services:
         hard: 2048
     ports:
       - "9100:9100"
-      - "80:8080"
+      - "80:80"
+    environment:
+      MINIPRINT_PERSONA: ${MINIPRINT_PERSONA:-random}
     tmpfs:
       - /tmp:size=16m,noexec,nosuid,nodev
     volumes:
       - ./log/:/app/log/
       - ./uploads/:/app/uploads/
+      - ./data/:/app/data/

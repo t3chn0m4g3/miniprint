@@ -37,6 +37,8 @@ from web_admin import create_http_server
 from connection_limits import ConnectionLimitedMixIn
 from telemetry import ContextLoggerAdapter, format_utc
 from pjl_stream import PJLStream, StreamLimit
+from personas import PERSONAS, Identity, load_identity
+from device_state import DeviceStateStore
 
 
 DEFAULT_CHUNK_BYTES = 4096
@@ -45,8 +47,8 @@ DEFAULT_MAX_CONNECTIONS = 16
 DEFAULT_TIMEOUT = 60
 DEFAULT_SESSION_TIMEOUT = 300
 DEFAULT_PJL_PORT = 9100
-DEFAULT_HTTP_PORT = 8080
-FILE_LOG_EXCLUDED_EVENTS = {"server_start", "signal", "server_stop"}
+DEFAULT_HTTP_PORT = 80
+FILE_LOG_EXCLUDED_EVENTS = {"server_start", "signal", "server_stop", "identity_ephemeral"}
 STANDARD_LOG_ATTRS = {
     "args",
     "asctime",
@@ -88,6 +90,9 @@ class ServerConfig:
     max_virtual_file_bytes: int = DEFAULT_MAX_VIRTUAL_FILE_BYTES
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     http_enabled: bool = True
+    persona: str = "random"
+    state_dir: str = "data"
+    reroll_identity: bool = False
 
 
 class JSONFormatter(logging.Formatter):
@@ -130,9 +135,16 @@ class LimitedThreadingTCPServer(ConnectionLimitedMixIn, socketserver.ThreadingMi
         config: ServerConfig,
         logger: logging.Logger,
         connection_slots: threading.BoundedSemaphore | None = None,
+        identity: Identity | None = None,
+        device_store: DeviceStateStore | None = None,
     ) -> None:
         self.config = config
-        self.logger = logger
+        self.identity = identity or load_identity(
+            config.persona, config.state_dir, logger, reroll=config.reroll_identity
+        )
+        self.persona = PERSONAS[self.identity.persona]
+        self.device_store = device_store or DeviceStateStore()
+        self.logger = ContextLoggerAdapter(logger, {"persona": self.persona.name})
         self.connection_slots = (
             connection_slots if connection_slots is not None else threading.BoundedSemaphore(config.max_connections)
         )
@@ -183,12 +195,16 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         stream = None
         session_failed = False
         try:
+            self.device = self.server.device_store.get(self.client_address[0])
             printer = Printer(
                 self.log,
                 upload_dir=config.uploads_dir,
                 max_job_bytes=config.max_job_bytes,
                 max_response_bytes=config.max_response_bytes,
                 max_virtual_file_bytes=config.max_virtual_file_bytes,
+                persona=self.server.persona,
+                identity=self.server.identity,
+                device=self.device,
             )
             stream = PJLStream(
                 printer,
@@ -335,7 +351,12 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         response = bytearray()
         for command in [data]:
             try:
-                command_response = self._process_command(printer, command)
+                with printer.device.lock:
+                    printer.fs = printer.device.fs
+                    from pyfakefs.fake_filesystem import FakeOsModule
+
+                    printer.fos = FakeOsModule(printer.fs)
+                    command_response = self._process_command(printer, command)
                 if len(response) + len(command_response) <= self.server.config.max_response_bytes:
                     response.extend(command_response)
                 else:
@@ -396,32 +417,30 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         if printer.printing_raw_job:
             printer.save_raw_print_job()
 
-        if command_name == "ECHO":
-            response = printer.command_echo(text)
-        elif command_name == "USTATUSOFF":
-            response = printer.command_ustatusoff(text)
-        elif text.startswith("INFO ID"):
-            response = printer.command_info_id(text)
-        elif text.startswith("INFO STATUS"):
-            response = printer.command_info_status(text)
-        elif command_name == "FSDIRLIST":
-            response = printer.command_fsdirlist(text)
-        elif command_name == "FSQUERY":
-            response = printer.command_fsquery(text)
-        elif command_name == "FSMKDIR":
-            response = printer.command_fsmkdir(text)
-        elif command_name == "FSUPLOAD":
-            response = printer.command_fsupload(text)
-        elif command_name == "FSDOWNLOAD":
-            response = printer.command_fsdownload(command_body)
-        elif command_name == "FSAPPEND":
-            response = printer.command_fsappend(command_body)
-        elif command_name == "FSDELETE":
-            response = printer.command_fsdelete(text)
-        elif command_name == "FSINIT":
-            response = printer.command_fsinit(text)
-        elif command_name == "RDYMSG":
-            response = printer.command_rdymsg(text)
+        handlers = {
+            "ECHO": printer.command_echo,
+            "USTATUSOFF": printer.command_ustatusoff,
+            "INFO": printer.command_info,
+            "FSDIRLIST": printer.command_fsdirlist,
+            "FSQUERY": printer.command_fsquery,
+            "FSMKDIR": printer.command_fsmkdir,
+            "FSUPLOAD": printer.command_fsupload,
+            "FSDOWNLOAD": printer.command_fsdownload,
+            "FSAPPEND": printer.command_fsappend,
+            "FSDELETE": printer.command_fsdelete,
+            "FSINIT": printer.command_fsinit,
+            "RDYMSG": printer.command_rdymsg,
+            "INQUIRE": printer.command_variable,
+            "DINQUIRE": printer.command_variable,
+            "SET": printer.command_variable,
+            "DEFAULT": printer.command_variable,
+            "JOB": printer.command_job,
+            "EOJ": printer.command_job,
+            "RNVRAM": printer.command_rnvram,
+        }
+        handler = handlers.get(command_name)
+        if handler:
+            response = handler(command_body if command_name in ("FSDOWNLOAD", "FSAPPEND") else text)
         else:
             self.log.info(
                 "Unknown PJL command received",
@@ -446,6 +465,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pjl-port", type=int, default=DEFAULT_PJL_PORT)
     parser.add_argument("--http-port", type=int, default=DEFAULT_HTTP_PORT)
     parser.add_argument("--no-http", action="store_true")
+    parser.add_argument(
+        "--persona", choices=(*PERSONAS, "random"), default=os.environ.get("MINIPRINT_PERSONA", "random")
+    )
+    parser.add_argument("--state-dir", default="data")
+    parser.add_argument("--reroll-identity", action="store_true")
     parser.add_argument("-l", "--log-file", dest="log_file", default="./miniprint.log")
     parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--session-timeout", type=float, default=DEFAULT_SESSION_TIMEOUT)
@@ -474,6 +498,9 @@ def config_from_args(argv: list[str] | None = None) -> ServerConfig:
         max_virtual_file_bytes=args.max_virtual_file_bytes,
         max_response_bytes=args.max_response_bytes,
         http_enabled=not args.no_http,
+        persona=args.persona,
+        state_dir=args.state_dir,
+        reroll_identity=args.reroll_identity,
     )
 
 
@@ -513,6 +540,9 @@ def healthcheck(host: str, pjl_port: int, http_port: int, http_enabled: bool) ->
 
 def serve(config: ServerConfig, logger: logging.Logger) -> None:
     Path(config.uploads_dir).mkdir(parents=True, exist_ok=True)
+    identity = load_identity(config.persona, config.state_dir, logger, reroll=config.reroll_identity)
+    logger = ContextLoggerAdapter(logger, {"persona": identity.persona})
+    device_store = DeviceStateStore()
     connection_slots = threading.BoundedSemaphore(config.max_connections)
     pjl_server = LimitedThreadingTCPServer(
         (config.host, config.pjl_port),
@@ -520,6 +550,8 @@ def serve(config: ServerConfig, logger: logging.Logger) -> None:
         config,
         logger,
         connection_slots,
+        identity=identity,
+        device_store=device_store,
     )
     http_server = None
     servers: list[Any] = [pjl_server]
@@ -530,6 +562,10 @@ def serve(config: ServerConfig, logger: logging.Logger) -> None:
             config.max_request_bytes,
             max_connections=config.max_connections,
             connection_slots=connection_slots,
+            identity=identity,
+            device_store=device_store,
+            uploads_dir=config.uploads_dir,
+            max_job_bytes=config.max_job_bytes,
         )
         servers.append(http_server)
 

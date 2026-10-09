@@ -9,3 +9,5 @@ uploads/
 venv*/
 .venv/
 .Trash-*/
+
+data/
