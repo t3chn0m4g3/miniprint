@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import csv
-import io
 import http.client
+import io
 import json
 import os
 import socket
@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("MINIPRINT_CONTAINER_SMOKE") != "1",
@@ -241,7 +240,7 @@ def test_container_brother_chain_and_large_job_capture() -> None:
             connection.request("GET", "/etc/mnt_info.csv")
             response = connection.getresponse()
             assert response.status == 200
-            serial = list(csv.DictReader(io.StringIO(response.read().decode())))[0]["Serial No."]
+            serial = next(csv.DictReader(io.StringIO(response.read().decode())))["Serial No."]
             assert response.version == 11
             assert len([v for k, v in response.getheaders() if k.lower() == "server"]) == 1
             from urllib.parse import urlencode

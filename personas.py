@@ -141,11 +141,12 @@ def load_identity(selection: str, state_dir: str | Path, logger: logging.Logger,
     if not reroll:
         try:
             identity = Identity(**json.loads(path.read_text()))
-            if identity.persona in PERSONAS and all(
-                isinstance(value, str) and value for value in asdict(identity).values()
+            if (
+                identity.persona in PERSONAS
+                and all(isinstance(value, str) and value for value in asdict(identity).values())
+                and selection in ("random", identity.persona)
             ):
-                if selection in ("random", identity.persona):
-                    return identity
+                return identity
         except OSError, ValueError, TypeError:
             pass
     name = secrets.choice(tuple(PERSONAS)) if selection == "random" else selection

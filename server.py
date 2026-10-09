@@ -27,19 +27,18 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
 
+from connection_limits import ConnectionLimitedMixIn
+from device_state import DeviceStateStore, RebootRequested
+from personas import PERSONAS, Identity, load_identity
+from pjl_stream import PJLStream, StreamLimit
 from printer import (
     DEFAULT_MAX_JOB_BYTES,
     DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_MAX_VIRTUAL_FILE_BYTES,
     Printer,
 )
-from web_admin import create_http_server
-from connection_limits import ConnectionLimitedMixIn
 from telemetry import ContextLoggerAdapter, format_utc
-from pjl_stream import PJLStream, StreamLimit
-from personas import PERSONAS, Identity, load_identity
-from device_state import DeviceStateStore, RebootRequested
-
+from web_admin import create_http_server
 
 DEFAULT_CHUNK_BYTES = 4096
 DEFAULT_MAX_REQUEST_BYTES = 64 * 1024
@@ -221,7 +220,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         except RebootRequested:
             if stream is not None:
                 stream.pending.clear()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed session is logged, never fatal to the server
             session_failed = True
             self.log.warning(
                 "Session failed",
@@ -238,7 +237,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                         stream.finish()
                     except StreamLimit:
                         pass
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - keep the session end and later artifacts
                         self.log.warning(
                             "Artifact save failed", extra={"event": "artifact_error", "error_type": type(exc).__name__}
                         )
@@ -250,7 +249,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                         if active:
                             try:
                                 save()
-                            except Exception as exc:
+                            except Exception as exc:  # noqa: BLE001 - keep the session end and later artifacts
                                 self.log.warning(
                                     "Artifact save failed",
                                     extra={
@@ -382,7 +381,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                     )
             except RebootRequested:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one bad PJL command must not end the session
                 self.log.warning(
                     "PJL command failed",
                     extra={

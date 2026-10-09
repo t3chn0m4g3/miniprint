@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from printer import Printer, RESET_SEQUENCE
+from printer import RESET_SEQUENCE, Printer
 
 
 class StreamLimit(Exception):
@@ -103,7 +103,7 @@ class PJLStream:
             frame = bytes(self.pending[:end])
             del self.pending[:end]
             self._count_request(len(frame))
-            match = re.fullmatch(rb"@PJL\s+ENTER\s+LANGUAGE\s*=\s*([A-Za-z0-9_-]+)\s*", stripped, re.I)
+            match = re.fullmatch(rb"@PJL\s+ENTER\s+LANGUAGE\s*=\s*([A-Za-z0-9_-]+)\s*", stripped, re.IGNORECASE)
             if match:
                 self.language = match[1].decode().upper()
                 self.printer.logger.info(

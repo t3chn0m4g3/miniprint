@@ -9,22 +9,21 @@ import tempfile
 import threading
 import time
 import unittest
+from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import patch
-from http.client import HTTPConnection
-
-from web_admin import create_http_server
 
 from server import (
     JSONFormatter,
     LimitedThreadingTCPServer,
     PJLRequestHandler,
     ServerConfig,
-    configure_logger,
-    healthcheck,
-    container_healthcheck_config,
     config_from_args,
+    configure_logger,
+    container_healthcheck_config,
+    healthcheck,
 )
+from web_admin import create_http_server
 
 
 class ListHandler(logging.Handler):

@@ -1,32 +1,31 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
-import csv
-import io
-import time
-from http.cookies import SimpleCookie
-from email.parser import BytesParser
-from email.policy import default as email_policy
 import html
+import io
 import json
 import logging
 import threading
+import time
 import uuid
 from datetime import UTC, datetime
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from http import HTTPStatus
-from ipaddress import ip_address
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse, urlencode, urlunparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 
-from connection_limits import ConnectionLimitedMixIn
-from telemetry import ContextLoggerAdapter, format_utc
-from personas import PERSONAS, Identity, new_identity
-from device_state import DeviceStateStore
 from brother import AuthSessions, brother_default_password
+from connection_limits import ConnectionLimitedMixIn
+from device_state import DeviceStateStore
+from personas import PERSONAS, Identity, new_identity
 from printer import Printer
-
+from telemetry import ContextLoggerAdapter, format_utc
 
 SSRF_PARAMETERS = {"url", "uri", "target", "server", "dest", "callback", "address", "host"}
 # Form names are attacker-chosen; log them as values so they never become schema keys.
@@ -142,7 +141,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         self.request_completed = False
         try:
             super().handle_one_request()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a failed request is logged, the server keeps serving
             self.close_connection = True
             self.log.warning("HTTP request failed", extra={"event": "http_error", "error_type": type(exc).__name__})
         finally:
@@ -266,11 +265,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._send_response(HTTPStatus.OK, output.getvalue().encode(), "text/csv", head_only=head_only)
             elif path in self.server.login_paths and (path not in self.server.info_paths or self.command == "POST"):
                 self._handle_login(body_params, head_only)
-            elif path in self.server.admin_paths or (
-                path.startswith(self.server.persona.admin_prefix + "/") and path not in self.server.info_paths
+            elif (
+                path in self.server.admin_paths
+                or (path.startswith(self.server.persona.admin_prefix + "/") and path not in self.server.info_paths)
+                or path in self.server.firmware_paths
             ):
-                self._handle_admin(path, body_params, body, head_only)
-            elif path in self.server.firmware_paths:
                 self._handle_admin(path, body_params, body, head_only)
             elif path.endswith(".xml") or path == "/deviceinfo.xml":
                 self._send_xml(HTTPStatus.OK, self._device_xml(), head_only=head_only)
@@ -368,7 +367,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             cookie.load(self.headers.get("Cookie", ""))
             token = cookie.get("AuthCookie")
             return bool(token and self.server.auth.valid(token.value, self.client_address[0]))
-        except Exception:
+        except Exception:  # noqa: BLE001 - any malformed cookie means not authenticated
             return False
 
     def _handle_login(self, params: dict[str, list[str]], head_only: bool) -> None:

@@ -8,8 +8,8 @@ from urllib.parse import urlencode
 
 import pytest
 
-from personas import PERSONAS, load_identity
 from brother import brother_default_password
+from personas import PERSONAS, load_identity
 from web_admin import create_http_server
 
 
@@ -116,7 +116,7 @@ def test_passback_target_skips_ports_and_empty_hosts(web):
 
 
 def test_cookie_expiry_wrong_password_and_upload_limit(web):
-    server, records, _ = web
+    server, _, _ = web
     assert request(server, "/login", urlencode({"username": "admin", "password": "wrong"}))[0] == 401
     cookie, _ = login(server)
     with server.auth.lock:
@@ -127,8 +127,8 @@ def test_cookie_expiry_wrong_password_and_upload_limit(web):
 
 
 def test_crash_probe_only_affects_brother_source():
-    from printer import Printer
     from device_state import DeviceStateStore, RebootRequested
+    from printer import Printer
 
     store = DeviceStateStore()
     printer = Printer(logging.getLogger("p"), persona=PERSONAS["brother"], device=store.get("a"))

@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from pyfakefs import fake_filesystem
-from device_state import DeviceState, RebootRequested
-from personas import Persona, Identity, PERSONAS, new_identity
 
+from device_state import DeviceState, RebootRequested
+from personas import PERSONAS, Identity, Persona, new_identity
 
 DEFAULT_MAX_JOB_BYTES = 1 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024
@@ -515,7 +515,7 @@ class Printer:
             header = (
                 f"@PJL FSUPLOAD FORMAT:BINARY NAME={self.format_device_name(upload_file)} "
                 f"OFFSET=0 SIZE={len(contents)}\r\n"
-            ).encode("utf-8")
+            ).encode()
             # Never truncate a binary body while advertising the original SIZE.
             if len(header) + len(contents) > self.max_response_bytes:
                 self.logger.warning(

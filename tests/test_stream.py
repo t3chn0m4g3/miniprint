@@ -2,7 +2,7 @@ import logging
 
 import pytest
 
-from printer import Printer, RESET_SEQUENCE
+from printer import RESET_SEQUENCE, Printer
 
 
 def make_stream(tmp_path, **limits):

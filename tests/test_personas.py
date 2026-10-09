@@ -1,8 +1,8 @@
 import logging
 from unittest.mock import patch
 
-from personas import PERSONAS, load_identity
 from device_state import DeviceStateStore
+from personas import PERSONAS, load_identity
 
 
 def test_random_identity_is_stable(tmp_path):
@@ -101,6 +101,7 @@ def test_variables_default_and_info_families():
 def test_http_profiles_headers_and_error_pages(tmp_path):
     import threading
     from http.client import HTTPConnection
+
     from web_admin import create_http_server
 
     for name, persona in PERSONAS.items():

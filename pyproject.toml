@@ -1,6 +1,6 @@
 [project]
 name = "miniprint"
-version = "0.2.1"
+version = "0.2.2"
 description = "A medium-interaction printer honeypot for PJL and passive web-admin probes."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"

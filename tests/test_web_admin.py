@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import logging
 import socket
-import time
 import threading
+import time
 import unittest
 import uuid
 from http.client import HTTPConnection
-from urllib.parse import urlencode
 from unittest.mock import patch
+from urllib.parse import urlencode
 
-from web_admin import create_http_server, WebAdminHandler
+from web_admin import WebAdminHandler, create_http_server
 
 
 class ListHandler(logging.Handler):
