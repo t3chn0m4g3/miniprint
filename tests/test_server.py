@@ -197,6 +197,22 @@ class ServerTestCase(unittest.TestCase):
         self.assertIn(b'DISPLAY="Busy"', response)
         self.assertTrue(all(record.persona == "hp" for record in self.handler.records))
 
+    def test_brother_crash_closes_and_suppresses_only_same_source(self) -> None:
+        address = self.start_server(persona="brother")
+        response = self.exchange(address, b"@PJL SET FORMLINES=bad\n@PJL INFO ID\n")
+        self.assertEqual(response, b"")
+        self.wait_for_event("pjl_crash_probe")
+        self.assertEqual(self.exchange(address, b"@PJL INFO ID\n"), b"")
+        self.wait_for_event("reboot_suppressed")
+        # macOS does not provide 127.0.0.2 by default; route this request to
+        # a second source state without changing the host network configuration.
+        original_get = self.server.device_store.get
+        with patch.object(self.server.device_store, "get", side_effect=lambda source: original_get("127.0.0.2")):
+            self.assertIn(b"Brother", self.exchange(address, b"@PJL INFO ID\n"))
+        self.server.device_store.get("127.0.0.1").reboot_until = 0
+        self.assertIn(b"Brother", self.exchange(address, b"@PJL INFO ID\n"))
+        self.assertNotIn("command_error", [r.event for r in self.handler.records])
+
     def test_parse_commands_preserves_raw_segments(self) -> None:
         commands = PJLRequestHandler.parse_commands(b"hello@PJL INFO ID\r\n@PJL USTATUSOFF\r\n")
         self.assertEqual(commands, [b"hello", b"@PJL INFO ID\r\n", b"@PJL USTATUSOFF\r\n"])

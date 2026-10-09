@@ -14,12 +14,14 @@ import hashlib
 import os
 import posixpath
 import re
+import secrets
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from pyfakefs import fake_filesystem
-from device_state import DeviceState
+from device_state import DeviceState, RebootRequested
 from personas import Persona, Identity, PERSONAS, new_identity
 
 
@@ -560,6 +562,23 @@ class Printer:
             store = self.device.defaults if command == "DINQUIRE" else self.device.variables
             return self._response(f"@PJL {command} {value.upper()}\r\n{store.get(value.upper(), '?')}\r\n\x0c")
         params = self.get_parameters(value)
+        if self.persona.name == "brother" and command == "SET" and "FORMLINES" in params:
+            try:
+                int(params["FORMLINES"])
+            except ValueError:
+                duration = 60 + secrets.randbelow(61)
+                self.device.reboot_until = time.monotonic() + duration
+                self.logger.info(
+                    "Simulated printer reboot",
+                    extra={
+                        "event": "pjl_crash_probe",
+                        "command": "SET",
+                        "variable": "FORMLINES",
+                        "cve_hint": "CVE-2024-51982",
+                        "reboot_seconds": duration,
+                    },
+                )
+                raise RebootRequested()
         for key, val in params.items():
             self.device.variables[key] = val
             if command == "DEFAULT":

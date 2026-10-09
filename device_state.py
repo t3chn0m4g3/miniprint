@@ -38,3 +38,7 @@ class DeviceStateStore:
             while len(self.entries) > self.max_entries:
                 self.entries.popitem(last=False)
             return value
+
+
+class RebootRequested(Exception):
+    """Stop this connection after a simulated Brother crash."""

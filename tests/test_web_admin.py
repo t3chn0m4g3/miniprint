@@ -174,7 +174,7 @@ class WebAdminTestCase(unittest.TestCase):
 
     def test_postscript_firmware_probe_is_logged(self) -> None:
         status, body = self.request("/firmware/update", data=b"%!PS\nsetpagedevice", method="POST")
-        self.assertEqual(status, 202)
-        self.assertIn("queued", body)
+        self.assertEqual(status, 401)
+        self.assertIn("Authentication Required", body)
         self.assertIn("firmware_probe", self.events())
         self.assertNotIn("CVE-2025-65079..65081", self.hints())

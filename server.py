@@ -38,7 +38,7 @@ from connection_limits import ConnectionLimitedMixIn
 from telemetry import ContextLoggerAdapter, format_utc
 from pjl_stream import PJLStream, StreamLimit
 from personas import PERSONAS, Identity, load_identity
-from device_state import DeviceStateStore
+from device_state import DeviceStateStore, RebootRequested
 
 
 DEFAULT_CHUNK_BYTES = 4096
@@ -170,6 +170,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         super().setup()
         self.session_id = str(uuid.uuid4())
         self.data_seen = False
+        self.session_logged = False
         self.bytes_received = 0
         self.session_start = datetime.now(UTC)
         self.session_deadline = time.monotonic() + self.server.config.session_timeout
@@ -196,6 +197,10 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         session_failed = False
         try:
             self.device = self.server.device_store.get(self.client_address[0])
+            if self.device.reboot_until > time.monotonic():
+                self.data_seen = True
+                self.log.info("Device reboot in progress", extra={"event": "reboot_suppressed"})
+                return
             printer = Printer(
                 self.log,
                 upload_dir=config.uploads_dir,
@@ -213,6 +218,9 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                 max_job_bytes=config.max_job_bytes,
             )
             self._handle_loop(printer, stream)
+        except RebootRequested:
+            if stream is not None:
+                stream.pending.clear()
         except Exception as exc:
             session_failed = True
             self.log.warning(
@@ -252,7 +260,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                                     },
                                 )
             finally:
-                if self.data_seen or session_failed:
+                if self.data_seen or session_failed or self.session_logged:
                     self.log.info(
                         "Connection closed",
                         extra=self._session_end_extra(
@@ -278,16 +286,19 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         while True:
             remaining = self.session_deadline - time.monotonic()
             if remaining <= 0:
+                self.session_logged = True
                 self.log.info("Session deadline reached", extra={"action": "timeout", "event": "session_timeout"})
                 break
             self.request.settimeout(min(config.timeout, remaining))
             try:
                 data = self.request.recv(DEFAULT_CHUNK_BYTES)
             except TimeoutError:
+                self.session_logged = True
                 event = "session_timeout" if time.monotonic() >= self.session_deadline else "idle"
                 self.log.info("Connection timed out", extra={"action": "timeout", "event": event})
                 break
             except OSError as exc:
+                self.session_logged = True
                 self.log.warning(
                     "Socket receive failed",
                     extra={"action": "receive", "event": "receive_failed", "error": str(exc)},
@@ -369,6 +380,8 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                             "limit": self.server.config.max_response_bytes,
                         },
                     )
+            except RebootRequested:
+                raise
             except Exception as exc:
                 self.log.warning(
                     "PJL command failed",
