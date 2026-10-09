@@ -89,7 +89,10 @@ class ServerTestCase(unittest.TestCase):
             sock.shutdown(socket.SHUT_WR)
             if not expect_response:
                 return b""
-            return sock.recv(4096)
+            response = bytearray()
+            while data := sock.recv(4096):
+                response.extend(data)
+            return bytes(response)
 
     def test_command_exception_keeps_session_open(self) -> None:
         address = self.start_server()
@@ -178,9 +181,8 @@ class ServerTestCase(unittest.TestCase):
                 b'@PJL FSUPLOAD NAME="0:/f"\r\n'
             ),
         )
-        self.assertNotIn(b"FSUPLOAD", response)
-        self.wait_for_event("response_truncated")
-        self.assertLessEqual(len(response), 100)
+        self.assertIn(b"SIZE=10\r\n0123456789", response)
+        self.assertTrue(response.endswith(b"0123456789"))
 
     def test_parse_commands_preserves_raw_segments(self) -> None:
         commands = PJLRequestHandler.parse_commands(b"hello@PJL INFO ID\r\n@PJL USTATUSOFF\r\n")

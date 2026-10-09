@@ -238,3 +238,10 @@ curl http://127.0.0.1/deviceinfo.xml
 
 * frbexiga at BinaryEdge
 * Jens Mueller for the hacking-printers.net wiki
+
+Print streams selected by `@PJL ENTER LANGUAGE=` are captured through UEL or EOF
+with `.ps`, `.pcl`, `.pdf`, or `.prn` suffixes. `save_print_job` includes `language`
+and `artifact_type`. PJL command bytes and print payload bytes have separate
+cumulative limits; `job_too_large` and `connection_too_large` close the session
+while retaining the captured prefix. Unknown commands are logged at info level
+with a name, SHA-256 and bounded preview.

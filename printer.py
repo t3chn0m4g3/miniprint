@@ -126,7 +126,7 @@ class Printer:
         digest = hashlib.sha256(data).hexdigest()[:16]
         return f"{timestamp}_{digest}{suffix}"
 
-    def _save_artifact(self, suffix: str, data: bytes, event: str) -> str | None:
+    def _save_artifact(self, suffix: str, data: bytes, event: str, **metadata: Any) -> str | None:
         if not data:
             self.logger.info("Nothing to save", extra={"action": "saving", "event": event})
             return None
@@ -141,6 +141,8 @@ class Printer:
                 "action": "saving",
                 "event": event,
                 "file_name": filename,
+                "artifact_type": {".ps": "ps", ".pcl": "pcl", ".pdf": "pdf"}.get(suffix, "raw"),
+                **metadata,
                 "payload_sha256": hashlib.sha256(data).hexdigest(),
                 "size": len(data),
             },

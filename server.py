@@ -31,12 +31,12 @@ from printer import (
     DEFAULT_MAX_JOB_BYTES,
     DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_MAX_VIRTUAL_FILE_BYTES,
-    RESET_SEQUENCE,
     Printer,
 )
 from web_admin import create_http_server
 from connection_limits import ConnectionLimitedMixIn
 from telemetry import ContextLoggerAdapter, format_utc
+from pjl_stream import PJLStream, StreamLimit
 
 
 DEFAULT_CHUNK_BYTES = 4096
@@ -180,6 +180,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         config = self.server.config
         printer = None
+        stream = None
         session_failed = False
         try:
             printer = Printer(
@@ -189,7 +190,13 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                 max_response_bytes=config.max_response_bytes,
                 max_virtual_file_bytes=config.max_virtual_file_bytes,
             )
-            self._handle_loop(printer)
+            stream = PJLStream(
+                printer,
+                lambda frame: self._process_data(printer, frame),
+                max_request_bytes=config.max_request_bytes,
+                max_job_bytes=config.max_job_bytes,
+            )
+            self._handle_loop(printer, stream)
         except Exception as exc:
             session_failed = True
             self.log.warning(
@@ -202,6 +209,15 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
             )
         finally:
             try:
+                if stream is not None:
+                    try:
+                        stream.finish()
+                    except StreamLimit:
+                        pass
+                    except Exception as exc:
+                        self.log.warning(
+                            "Artifact save failed", extra={"event": "artifact_error", "error_type": type(exc).__name__}
+                        )
                 if printer is not None and self.data_seen:
                     for active, save in (
                         (printer.printing_raw_job, printer.save_raw_print_job),
@@ -241,7 +257,7 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                         ),
                     )
 
-    def _handle_loop(self, printer: Printer) -> None:
+    def _handle_loop(self, printer: Printer, stream: PJLStream) -> None:
         config = self.server.config
         while True:
             remaining = self.session_deadline - time.monotonic()
@@ -268,21 +284,25 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                 self.data_seen = True
                 self.log.info("Connection opened", extra={"action": "open_conn", "event": "connection"})
             self.bytes_received += len(data)
-            if self.bytes_received > config.max_request_bytes:
+            try:
+                if self.bytes_received > config.max_request_bytes + config.max_job_bytes:
+                    raise StreamLimit(
+                        "connection_too_large", self.bytes_received, config.max_request_bytes + config.max_job_bytes
+                    )
+                stream.feed(data)
+            except StreamLimit as exc:
                 self.log.warning(
-                    "Request exceeded configured limit",
+                    "Stream exceeded configured limit",
                     extra={
                         "action": "limit",
-                        "event": "request_too_large",
-                        "size": self.bytes_received,
-                        "limit": config.max_request_bytes,
+                        "event": exc.event,
+                        "size": exc.size,
+                        "limit": exc.limit,
                         "payload_sha256": Printer.payload_hash(data),
                         "payload_preview": Printer.payload_preview(data),
                     },
                 )
                 break
-
-            self._process_data(printer, data.replace(RESET_SEQUENCE, b""))
 
     def _is_loopback_client(self) -> bool:
         try:
@@ -312,25 +332,8 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                 },
             )
 
-        if data.startswith(b"%!"):
-            printer.receiving_postscript = True
-            printer.append_postscript(data)
-            self.log.info(
-                "Received first PostScript chunk",
-                extra={"action": "postscript", "event": "print_job"},
-            )
-            if b"%%EOF" in data:
-                printer.save_postscript()
-            return
-
-        if printer.receiving_postscript:
-            printer.append_postscript(data)
-            if b"%%EOF" in data:
-                printer.save_postscript()
-            return
-
         response = bytearray()
-        for command in self.parse_commands(data):
+        for command in [data]:
             try:
                 command_response = self._process_command(printer, command)
                 if len(response) + len(command_response) <= self.server.config.max_response_bytes:
@@ -420,9 +423,15 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
         elif command_name == "RDYMSG":
             response = printer.command_rdymsg(text)
         else:
-            self.log.warning(
+            self.log.info(
                 "Unknown PJL command received",
-                extra={"action": "cmd_unknown", "event": "unknown_command", "command": command_name},
+                extra={
+                    "action": "cmd_unknown",
+                    "event": "unknown_command",
+                    "command": command_name,
+                    "payload_sha256": Printer.payload_hash(command),
+                    "payload_preview": Printer.payload_preview(command),
+                },
             )
             response = b""
         return response
