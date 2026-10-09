@@ -19,6 +19,7 @@ import signal
 import socket
 import socketserver
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,12 +35,15 @@ from printer import (
     Printer,
 )
 from web_admin import create_http_server
+from connection_limits import ConnectionLimitedMixIn
+from telemetry import ContextLoggerAdapter, format_utc
 
 
 DEFAULT_CHUNK_BYTES = 4096
 DEFAULT_MAX_REQUEST_BYTES = 64 * 1024
 DEFAULT_MAX_CONNECTIONS = 16
 DEFAULT_TIMEOUT = 60
+DEFAULT_SESSION_TIMEOUT = 300
 DEFAULT_PJL_PORT = 9100
 DEFAULT_HTTP_PORT = 8080
 FILE_LOG_EXCLUDED_EVENTS = {"server_start", "signal", "server_stop"}
@@ -69,10 +73,6 @@ STANDARD_LOG_ATTRS = {
 }
 
 
-def format_utc(value: datetime) -> str:
-    return value.isoformat().replace("+00:00", "Z")
-
-
 @dataclass(frozen=True)
 class ServerConfig:
     host: str = "localhost"
@@ -80,6 +80,7 @@ class ServerConfig:
     http_port: int = DEFAULT_HTTP_PORT
     log_file: str = "./miniprint.log"
     timeout: int = DEFAULT_TIMEOUT
+    session_timeout: float = DEFAULT_SESSION_TIMEOUT
     uploads_dir: str = "uploads"
     max_connections: int = DEFAULT_MAX_CONNECTIONS
     max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES
@@ -117,17 +118,8 @@ class FileLogEventFilter(logging.Filter):
         return getattr(record, "event", None) not in FILE_LOG_EXCLUDED_EVENTS
 
 
-class ContextLoggerAdapter(logging.LoggerAdapter):
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        base_extra = dict(self.extra)
-        call_extra = kwargs.get("extra")
-        if call_extra:
-            base_extra.update(call_extra)
-        kwargs["extra"] = base_extra
-        return msg, kwargs
-
-
-class LimitedThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+class LimitedThreadingTCPServer(ConnectionLimitedMixIn, socketserver.ThreadingMixIn, socketserver.TCPServer):
+    protocol = "pjl"
     allow_reuse_address = True
     daemon_threads = True
 
@@ -137,10 +129,13 @@ class LimitedThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPSer
         handler_class: type[socketserver.BaseRequestHandler],
         config: ServerConfig,
         logger: logging.Logger,
+        connection_slots: threading.BoundedSemaphore | None = None,
     ) -> None:
         self.config = config
         self.logger = logger
-        self.connection_slots = threading.BoundedSemaphore(config.max_connections)
+        self.connection_slots = (
+            connection_slots if connection_slots is not None else threading.BoundedSemaphore(config.max_connections)
+        )
         super().__init__(server_address, handler_class)
 
 
@@ -161,11 +156,11 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
 
     def setup(self) -> None:
         super().setup()
-        self.slot_acquired = self.server.connection_slots.acquire(blocking=False)
         self.session_id = str(uuid.uuid4())
         self.data_seen = False
         self.bytes_received = 0
         self.session_start = datetime.now(UTC)
+        self.session_deadline = time.monotonic() + self.server.config.session_timeout
         src_ip, src_port = self.client_address
         local_address = self.request.getsockname()
         dest_ip, dest_port = local_address[0], local_address[1]
@@ -182,53 +177,83 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
             },
         )
 
-    def finish(self) -> None:
-        if getattr(self, "slot_acquired", False):
-            self.server.connection_slots.release()
-        super().finish()
-
     def handle(self) -> None:
-        if not self.slot_acquired:
-            self.log.warning(
-                "Connection refused because the active connection limit was reached",
-                extra=self._session_end_extra({"action": "reject", "event": "connection_limit"}),
-            )
-            return
-
         config = self.server.config
-        self.request.settimeout(config.timeout)
-        printer = Printer(
-            self.log,
-            upload_dir=config.uploads_dir,
-            max_job_bytes=config.max_job_bytes,
-            max_response_bytes=config.max_response_bytes,
-            max_virtual_file_bytes=config.max_virtual_file_bytes,
-        )
+        printer = None
+        session_failed = False
         try:
+            printer = Printer(
+                self.log,
+                upload_dir=config.uploads_dir,
+                max_job_bytes=config.max_job_bytes,
+                max_response_bytes=config.max_response_bytes,
+                max_virtual_file_bytes=config.max_virtual_file_bytes,
+            )
             self._handle_loop(printer)
+        except Exception as exc:
+            session_failed = True
+            self.log.warning(
+                "Session failed",
+                extra={
+                    "action": "error",
+                    "event": "session_error",
+                    "error_type": type(exc).__name__,
+                },
+            )
         finally:
-            if self.data_seen:
-                if printer.printing_raw_job:
-                    printer.save_raw_print_job()
-                if printer.receiving_postscript:
-                    printer.save_postscript()
-                self.log.info(
-                    "Connection closed",
-                    extra=self._session_end_extra({"action": "close_conn", "event": "connection_closed"}),
-                )
-            elif not self._is_loopback_client():
-                self.log.info(
-                    "Empty connection closed",
-                    extra=self._session_end_extra({"action": "close_conn", "event": "empty_connection"}),
-                )
+            try:
+                if printer is not None and self.data_seen:
+                    for active, save in (
+                        (printer.printing_raw_job, printer.save_raw_print_job),
+                        (printer.receiving_postscript, printer.save_postscript),
+                    ):
+                        if active:
+                            try:
+                                save()
+                            except Exception as exc:
+                                self.log.warning(
+                                    "Artifact save failed",
+                                    extra={
+                                        "action": "saving",
+                                        "event": "artifact_error",
+                                        "error_type": type(exc).__name__,
+                                    },
+                                )
+            finally:
+                if self.data_seen or session_failed:
+                    self.log.info(
+                        "Connection closed",
+                        extra=self._session_end_extra(
+                            {
+                                "action": "close_conn",
+                                "event": "connection_closed",
+                            }
+                        ),
+                    )
+                elif not self._is_loopback_client():
+                    self.log.info(
+                        "Empty connection closed",
+                        extra=self._session_end_extra(
+                            {
+                                "action": "close_conn",
+                                "event": "empty_connection",
+                            }
+                        ),
+                    )
 
     def _handle_loop(self, printer: Printer) -> None:
         config = self.server.config
         while True:
+            remaining = self.session_deadline - time.monotonic()
+            if remaining <= 0:
+                self.log.info("Session deadline reached", extra={"action": "timeout", "event": "session_timeout"})
+                break
+            self.request.settimeout(min(config.timeout, remaining))
             try:
                 data = self.request.recv(DEFAULT_CHUNK_BYTES)
             except TimeoutError:
-                self.log.info("Connection timed out", extra={"action": "timeout", "event": "idle"})
+                event = "session_timeout" if time.monotonic() >= self.session_deadline else "idle"
+                self.log.info("Connection timed out", extra={"action": "timeout", "event": event})
                 break
             except OSError as exc:
                 self.log.warning(
@@ -306,18 +331,32 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
 
         response = bytearray()
         for command in self.parse_commands(data):
-            response.extend(self._process_command(printer, command))
-        if response:
-            if len(response) > self.server.config.max_response_bytes:
-                response = response[: self.server.config.max_response_bytes]
+            try:
+                command_response = self._process_command(printer, command)
+                if len(response) + len(command_response) <= self.server.config.max_response_bytes:
+                    response.extend(command_response)
+                else:
+                    # Preserve whole replies so binary FSUPLOAD SIZE stays accurate.
+                    self.log.warning(
+                        "Omitted reply above response limit",
+                        extra={
+                            "action": "limit",
+                            "event": "response_truncated",
+                            "limit": self.server.config.max_response_bytes,
+                        },
+                    )
+            except Exception as exc:
                 self.log.warning(
-                    "Truncated oversized response",
+                    "PJL command failed",
                     extra={
-                        "action": "limit",
-                        "event": "response_truncated",
-                        "limit": self.server.config.max_response_bytes,
+                        "action": "error",
+                        "event": "command_error",
+                        "error_type": type(exc).__name__,
+                        "payload_sha256": Printer.payload_hash(command),
+                        "payload_preview": Printer.payload_preview(command),
                     },
                 )
+        if response:
             self.request.sendall(bytes(response))
             self.log.info("Response sent", extra={"action": "response", "event": "response_sent"})
 
@@ -385,8 +424,8 @@ class PJLRequestHandler(socketserver.BaseRequestHandler):
                 "Unknown PJL command received",
                 extra={"action": "cmd_unknown", "event": "unknown_command", "command": command_name},
             )
-            response = ""
-        return response.encode("utf-8", errors="replace")
+            response = b""
+        return response
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -400,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-http", action="store_true")
     parser.add_argument("-l", "--log-file", dest="log_file", default="./miniprint.log")
     parser.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--session-timeout", type=float, default=DEFAULT_SESSION_TIMEOUT)
     parser.add_argument("--uploads-dir", default="uploads")
     parser.add_argument("--max-connections", type=int, default=DEFAULT_MAX_CONNECTIONS)
     parser.add_argument("--max-request-bytes", type=int, default=DEFAULT_MAX_REQUEST_BYTES)
@@ -417,6 +457,7 @@ def config_from_args(argv: list[str] | None = None) -> ServerConfig:
         http_port=args.http_port,
         log_file=args.log_file,
         timeout=args.timeout,
+        session_timeout=args.session_timeout,
         uploads_dir=args.uploads_dir,
         max_connections=args.max_connections,
         max_request_bytes=args.max_request_bytes,
@@ -463,11 +504,24 @@ def healthcheck(host: str, pjl_port: int, http_port: int, http_enabled: bool) ->
 
 def serve(config: ServerConfig, logger: logging.Logger) -> None:
     Path(config.uploads_dir).mkdir(parents=True, exist_ok=True)
-    pjl_server = LimitedThreadingTCPServer((config.host, config.pjl_port), PJLRequestHandler, config, logger)
+    connection_slots = threading.BoundedSemaphore(config.max_connections)
+    pjl_server = LimitedThreadingTCPServer(
+        (config.host, config.pjl_port),
+        PJLRequestHandler,
+        config,
+        logger,
+        connection_slots,
+    )
     http_server = None
     servers: list[Any] = [pjl_server]
     if config.http_enabled:
-        http_server = create_http_server((config.host, config.http_port), logger, config.max_request_bytes)
+        http_server = create_http_server(
+            (config.host, config.http_port),
+            logger,
+            config.max_request_bytes,
+            max_connections=config.max_connections,
+            connection_slots=connection_slots,
+        )
         servers.append(http_server)
 
     for server in servers:
@@ -502,10 +556,22 @@ def serve(config: ServerConfig, logger: logging.Logger) -> None:
         logger.info("Servers stopped", extra={"action": "stop", "event": "server_stop"})
 
 
+def container_healthcheck_config(cmdline_path: str = "/proc/1/cmdline") -> ServerConfig:
+    arguments = Path(cmdline_path).read_bytes().decode().rstrip("\0").split("\0")
+    for index, argument in enumerate(arguments):
+        if Path(argument).name == "server.py":
+            return config_from_args(arguments[index + 1 :])
+    raise ValueError("Container process is not miniprint server.py")
+
+
 def main(argv: list[str] | None = None) -> int:
-    config = config_from_args(argv)
     if os.environ.get("MINIPRINT_HEALTHCHECK") == "1":
+        try:
+            config = container_healthcheck_config()
+        except OSError, ValueError:
+            return 1
         return healthcheck("127.0.0.1", config.pjl_port, config.http_port, config.http_enabled)
+    config = config_from_args(argv)
     logger = configure_logger(config.log_file)
     serve(config, logger)
     return 0

@@ -56,7 +56,9 @@ The Docker image starts miniprint with explicit conservative application limits:
 | Limit | Docker value |
 |:--|--:|
 | Connection timeout | `60s` |
-| Concurrent PJL connections | `16` |
+| Total concurrent PJL and HTTP connections | `16` |
+| PJL session deadline | `300s` |
+| HTTP socket timeout | `15s` |
 | Request size | `65,536 bytes` |
 | Print/PostScript job artifact | `1,048,576 bytes` |
 | Virtual filesystem file | `262,144 bytes` |
@@ -75,8 +77,13 @@ docker buildx build --platform linux/amd64,linux/arm64 -t miniprint:latest .
 ```
 
 The container healthcheck performs local TCP checks against the PJL and HTTP
-listeners. Empty loopback PJL connections are filtered so routine healthchecks do
+listeners, using the running server arguments from `/proc/1/cmdline`; `--no-http`
+disables the HTTP probe and custom ports are honored. Empty loopback connections are filtered so routine healthchecks do
 not fill `log/miniprint.json` with connection open/close events.
+
+The image defaults to UID/GID `2000:2000` for T-Pot data volumes. Override these
+with Docker build arguments `MINIPRINT_UID` and `MINIPRINT_GID` when needed.
+Existing Linux bind mounts must be writable by the configured UID/GID.
 
 ## Local Development
 
@@ -107,7 +114,7 @@ above is enough.
 ```text
 usage: miniprint [-h] [-b HOST] [--pjl-port PJL_PORT] [--http-port HTTP_PORT]
                  [--no-http] [-l LOG_FILE] [-t TIMEOUT]
-                 [--uploads-dir UPLOADS_DIR]
+                 [--session-timeout SESSION_TIMEOUT] [--uploads-dir UPLOADS_DIR]
                  [--max-connections MAX_CONNECTIONS]
                  [--max-request-bytes MAX_REQUEST_BYTES]
                  [--max-job-bytes MAX_JOB_BYTES]
@@ -153,8 +160,20 @@ fields such as:
 }
 ```
 
-Terminal connection events additionally include `session_end` and
-`session_duration`.
+### Log schema
+
+Each logged connection has one terminal event with `session_end` and
+`session_duration`: `connection_closed`, `empty_connection`,
+`http_connection_closed`, or `connection_limit`. Empty loopback health checks
+are suppressed. HTTP requests emit `http_request_completed` without
+`session_end`; the HTTP connection closes separately, including on errors.
+This replaces the former HTTP close event emitted per request.
+
+`command_error` records a failed PJL command's `error_type`, `payload_sha256`,
+and `payload_preview`; subsequent commands can still run. `session_timeout`
+marks the PJL total deadline. `session_error` and `artifact_error` record
+unexpected session or artifact failures with `error_type` and are followed
+by the terminal connection event.
 
 Lifecycle/control events such as `server_start`, `signal`, and `server_stop`
 are emitted to the console, including Docker logs, but are intentionally not

@@ -10,8 +10,21 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from http.client import HTTPConnection
 
-from server import JSONFormatter, LimitedThreadingTCPServer, PJLRequestHandler, ServerConfig, configure_logger, healthcheck
+from web_admin import create_http_server
+
+from server import (
+    JSONFormatter,
+    LimitedThreadingTCPServer,
+    PJLRequestHandler,
+    ServerConfig,
+    configure_logger,
+    healthcheck,
+    container_healthcheck_config,
+    config_from_args,
+)
 
 
 class ListHandler(logging.Handler):
@@ -77,6 +90,97 @@ class ServerTestCase(unittest.TestCase):
             if not expect_response:
                 return b""
             return sock.recv(4096)
+
+    def test_command_exception_keeps_session_open(self) -> None:
+        address = self.start_server()
+        with patch("printer.Printer.command_fsmkdir", side_effect=OSError("broken")):
+            response = self.exchange(address, b'@PJL FSMKDIR NAME="0:/test"\r\n@PJL INFO ID\r\n')
+        self.assertIn(b"@PJL INFO ID", response)
+        self.wait_for_event("connection_closed")
+        errors = [record for record in self.handler.records if record.event == "command_error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].error_type, "OSError")
+        self.assertTrue(errors[0].payload_sha256)
+        self.assertEqual(sum(hasattr(record, "session_end") for record in self.handler.records), 1)
+
+    def test_session_deadline_bounds_idle_receive(self) -> None:
+        address = self.start_server(timeout=10, session_timeout=0.15)
+        with socket.create_connection(address, timeout=2) as sock:
+            sock.sendall(b"@PJL USTATUSOFF\r\n")
+            sock.settimeout(1)
+            started = time.monotonic()
+            self.assertEqual(sock.recv(4096), b"")
+            self.assertLess(time.monotonic() - started, 1)
+        self.wait_for_event("session_timeout")
+        self.wait_for_event("connection_closed")
+
+    def test_session_deadline_is_not_reset_by_incoming_data(self) -> None:
+        address = self.start_server(timeout=1, session_timeout=0.2)
+        with socket.create_connection(address, timeout=2) as sock:
+            for _ in range(3):
+                sock.sendall(b"@PJL USTATUSOFF\r\n")
+                time.sleep(0.05)
+            sock.settimeout(1)
+            self.assertEqual(sock.recv(4096), b"")
+        self.wait_for_event("session_timeout")
+
+    def test_artifact_failure_still_emits_one_session_end(self) -> None:
+        address = self.start_server()
+        with patch("printer.Printer.save_raw_print_job", side_effect=OSError("disk full")):
+            self.exchange(address, b"raw print body", expect_response=False)
+            self.wait_for_event("connection_closed")
+        self.assertEqual(sum(hasattr(record, "session_end") for record in self.handler.records), 1)
+        self.assertIn("artifact_error", [record.event for record in self.handler.records])
+
+    def test_connection_limit_is_shared_between_http_and_pjl(self) -> None:
+        address = self.start_server(max_connections=1)
+        web_server = create_http_server(
+            ("127.0.0.1", 0),
+            self.logger,
+            2048,
+            connection_slots=self.server.connection_slots,
+        )
+        web_thread = threading.Thread(target=web_server.serve_forever, daemon=True)
+        web_thread.start()
+        try:
+            with socket.create_connection(address, timeout=2) as sock:
+                sock.sendall(b"@PJL INFO ID\r\n")
+                self.assertIn(b"@PJL INFO ID", sock.recv(4096))
+                with socket.create_connection(web_server.server_address, timeout=2) as http_sock:
+                    self.assertEqual(http_sock.recv(4096), b"")
+                self.wait_for_event("connection_limit")
+                rejection = next(record for record in self.handler.records if record.event == "connection_limit")
+                self.assertEqual(rejection.protocol, "http")
+                self.assertTrue(rejection.session_end)
+            self.wait_for_event("connection_closed")
+            self.assertTrue(self.server.connection_slots.acquire(timeout=1))
+            self.server.connection_slots.release()
+            connection = HTTPConnection(*web_server.server_address, timeout=2)
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                response.read()
+            finally:
+                connection.close()
+        finally:
+            web_server.shutdown()
+            web_server.server_close()
+            web_thread.join(timeout=2)
+
+    def test_response_limit_does_not_split_fsupload_body(self) -> None:
+        address = self.start_server(max_response_bytes=100)
+        response = self.exchange(
+            address,
+            (
+                b'@PJL FSDOWNLOAD SIZE=10 NAME="0:/f"\r\n0123456789'
+                b"@PJL ECHO " + b"x" * 40 + b"\r\n"
+                b'@PJL FSUPLOAD NAME="0:/f"\r\n'
+            ),
+        )
+        self.assertNotIn(b"FSUPLOAD", response)
+        self.wait_for_event("response_truncated")
+        self.assertLessEqual(len(response), 100)
 
     def test_parse_commands_preserves_raw_segments(self) -> None:
         commands = PJLRequestHandler.parse_commands(b"hello@PJL INFO ID\r\n@PJL USTATUSOFF\r\n")
@@ -216,3 +320,25 @@ class ServerTestCase(unittest.TestCase):
         finally:
             hold_socket.close()
         self.wait_for_event("connection_limit")
+
+
+class HealthcheckConfigTestCase(unittest.TestCase):
+    def test_container_healthcheck_uses_running_server_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cmdline = Path(directory) / "cmdline"
+            cmdline.write_bytes(b"/app/.venv/bin/python\0./server.py\0--no-http\0--pjl-port\09101\0--http-port\08081\0")
+            config = container_healthcheck_config(str(cmdline))
+        self.assertFalse(config.http_enabled)
+        self.assertEqual(config.pjl_port, 9101)
+        self.assertEqual(config.http_port, 8081)
+
+    def test_container_healthcheck_fails_for_unknown_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cmdline = Path(directory) / "cmdline"
+            cmdline.write_bytes(b"sleep\0infinity\0")
+            with self.assertRaises(ValueError):
+                container_healthcheck_config(str(cmdline))
+
+    def test_session_timeout_cli_default_and_override(self) -> None:
+        self.assertEqual(config_from_args([]).session_timeout, 300)
+        self.assertEqual(config_from_args(["--session-timeout", "42"]).session_timeout, 42)

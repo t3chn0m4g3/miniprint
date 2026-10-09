@@ -27,6 +27,7 @@ UPLOADS_DIR = Path(os.environ.get("MINIPRINT_UPLOADS_DIR", "uploads"))
 
 EXPECTED_CMD_LIMITS = {
     "--timeout": "60",
+    "--session-timeout": "300",
     "--max-connections": "16",
     "--max-request-bytes": "65536",
     "--max-job-bytes": "1048576",

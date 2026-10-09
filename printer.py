@@ -147,10 +147,10 @@ class Printer:
         )
         return str(path)
 
-    def _response(self, text: str) -> str:
-        encoded = text.encode("utf-8", errors="replace")
+    def _response(self, data: bytes | str) -> bytes:
+        encoded = self._as_bytes(data)
         if len(encoded) <= self.max_response_bytes:
-            return text
+            return encoded
         self.logger.warning(
             "Response exceeded configured limit",
             extra={
@@ -160,10 +160,10 @@ class Printer:
                 "limit": self.max_response_bytes,
             },
         )
-        return encoded[: self.max_response_bytes].decode("utf-8", errors="replace")
+        return encoded[: self.max_response_bytes]
 
     def get_parameters(self, command: bytes | str) -> dict[str, str]:
-        text = self._as_text(command)
+        text = self._as_text(command).split("\n", 1)[0].removesuffix("\r")
         return {
             match.group(1).upper(): match.group(2) if match.group(2) is not None else match.group(3)
             for match in self.param_pattern.finditer(text)
@@ -171,7 +171,8 @@ class Printer:
 
     def _split_file_payload(self, request: bytes | str) -> tuple[bytes, bytes, dict[str, str], bool]:
         raw = self._as_bytes(request)
-        header, separator, payload = raw.partition(b"\r\n")
+        header, separator, payload = raw.partition(b"\n")
+        header = header.removesuffix(b"\r")
         parameters = self.get_parameters(header)
         size = parameters.get("SIZE")
         if size is not None:
@@ -182,8 +183,8 @@ class Printer:
             if expected_size < 0:
                 return header, b"", parameters, False
             payload = payload[:expected_size]
-        elif separator and payload.endswith(b"\r\n"):
-            payload = payload[:-2]
+        elif separator:
+            payload = payload.removesuffix(b"\r\n") if payload.endswith(b"\r\n") else payload.removesuffix(b"\n")
         return header, payload, parameters, True
 
     @staticmethod
@@ -214,10 +215,10 @@ class Printer:
         normalized = self.normalize_device_path(path)
         return bool(normalized and self.fos.path.exists(normalized))
 
-    def append_raw_print_job(self, data: bytes | str) -> str:
+    def append_raw_print_job(self, data: bytes | str) -> bytes:
         raw = self._as_bytes(data)
         if not raw:
-            return ""
+            return b""
         self.printing_raw_job = True
         available = self.max_job_bytes - len(self.current_raw_print_job)
         if available <= 0:
@@ -229,7 +230,7 @@ class Printer:
                 event="raw_job_too_large",
                 limit=self.max_job_bytes,
             )
-            return ""
+            return b""
         if len(raw) > available:
             self.current_raw_print_job.extend(raw[:available])
             self._log_payload(
@@ -240,7 +241,7 @@ class Printer:
                 event="raw_job_truncated",
                 limit=self.max_job_bytes,
             )
-            return ""
+            return b""
         self.current_raw_print_job.extend(raw)
         self._log_payload(
             "debug",
@@ -250,7 +251,7 @@ class Printer:
             event="append_raw_print_job",
             size=len(raw),
         )
-        return ""
+        return b""
 
     def append_postscript(self, data: bytes | str) -> None:
         raw = self._as_bytes(data)
@@ -278,7 +279,7 @@ class Printer:
             return
         self.postscript_data.extend(raw)
 
-    def command_fsdownload(self, request: bytes | str) -> str:
+    def command_fsdownload(self, request: bytes | str) -> bytes:
         _, file_bytes, request_parameters, payload_valid = self._split_file_payload(request)
         if not payload_valid:
             return self._response(f"@PJL FSDOWNLOAD {PJL_BAD_REQUEST}")
@@ -319,9 +320,9 @@ class Printer:
                 "size": len(file_bytes),
             },
         )
-        return ""
+        return b""
 
-    def command_fsappend(self, request: bytes | str) -> str:
+    def command_fsappend(self, request: bytes | str) -> bytes:
         _, payload, request_parameters, payload_valid = self._split_file_payload(request)
         if not payload_valid:
             return self._response(f"@PJL FSAPPEND {PJL_BAD_REQUEST}")
@@ -378,15 +379,15 @@ class Printer:
                 "total_size": total_size,
             },
         )
-        return ""
+        return b""
 
-    def command_echo(self, request: bytes | str) -> str:
+    def command_echo(self, request: bytes | str) -> bytes:
         text = self._as_text(request)
         response = "@PJL " + text + "\x1b"
         self.logger.info("Responding with echo", extra={"action": "response", "event": "echo"})
         return self._response(response)
 
-    def command_fsdirlist(self, request: bytes | str) -> str:
+    def command_fsdirlist(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         requested_dir = self.normalize_device_path(request_parameters.get("NAME"))
         if not requested_dir:
@@ -410,7 +411,7 @@ class Printer:
         response = f"@PJL FSDIRLIST NAME={self.format_device_name(requested_dir)}{return_entries}"
         return self._response(response)
 
-    def command_fsmkdir(self, request: bytes | str) -> str:
+    def command_fsmkdir(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         requested_dir = self.normalize_device_path(request_parameters.get("NAME"))
         if not requested_dir:
@@ -422,9 +423,9 @@ class Printer:
         )
         if not self.fos.path.exists(requested_dir):
             self.fs.create_dir(requested_dir)
-        return ""
+        return b""
 
-    def command_fsdelete(self, request: bytes | str) -> str:
+    def command_fsdelete(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         requested_name = self.normalize_device_path(request_parameters.get("NAME"))
         if not requested_name:
@@ -445,9 +446,9 @@ class Printer:
             "Virtual filesystem file deleted",
             extra={"action": "delete", "event": "fsdelete", "file_name": requested_name},
         )
-        return ""
+        return b""
 
-    def command_fsinit(self, request: bytes | str) -> str:
+    def command_fsinit(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         volume = request_parameters.get("VOLUME") or request_parameters.get("NAME")
         if volume and self.normalize_device_path(volume) is None:
@@ -458,9 +459,9 @@ class Printer:
             "Virtual filesystem initialized",
             extra={"action": "init", "event": "fsinit", "volume": volume or "0:"},
         )
-        return ""
+        return b""
 
-    def command_fsquery(self, request: bytes | str) -> str:
+    def command_fsquery(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         requested_item = self.normalize_device_path(request_parameters.get("NAME"))
         if not requested_item:
@@ -478,7 +479,7 @@ class Printer:
             return_data = f"NAME={self.format_device_name(requested_item)} {PJL_FILE_NOT_FOUND}"
         return self._response("@PJL FSQUERY " + return_data)
 
-    def command_fsupload(self, request: bytes | str) -> str:
+    def command_fsupload(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         upload_file = self.normalize_device_path(request_parameters.get("NAME"))
         if not upload_file:
@@ -490,31 +491,38 @@ class Printer:
         )
         if self.fos.path.exists(upload_file) and self.fos.path.isfile(upload_file):
             file_module = fake_filesystem.FakeFileOpen(self.fs)
-            with file_module(upload_file, "r") as handle:
+            with file_module(upload_file, "rb") as handle:
                 contents = handle.read()
-            size = self.fos.stat(upload_file).st_size
-            return_data = (
-                f"FORMAT:BINARY NAME={self.format_device_name(upload_file)} "
-                f"OFFSET=0 SIZE={size}\r\n{contents}"
-            )
-        else:
-            return_data = f"NAME={self.format_device_name(upload_file)}\r\n{PJL_FILE_NOT_FOUND}"
-        return self._response("@PJL FSUPLOAD " + return_data)
+            header = (
+                f"@PJL FSUPLOAD FORMAT:BINARY NAME={self.format_device_name(upload_file)} "
+                f"OFFSET=0 SIZE={len(contents)}\r\n"
+            ).encode("utf-8")
+            # Never truncate a binary body while advertising the original SIZE.
+            if len(header) + len(contents) > self.max_response_bytes:
+                self.logger.warning(
+                    "File response exceeded configured limit",
+                    extra={
+                        "action": "limit",
+                        "event": "response_too_large",
+                        "size": len(header) + len(contents),
+                        "limit": self.max_response_bytes,
+                    },
+                )
+                return self._response("@PJL FSUPLOAD FILEERROR=1\r\n")
+            return header + contents
+        return self._response(f"@PJL FSUPLOAD NAME={self.format_device_name(upload_file)}\r\n{PJL_FILE_NOT_FOUND}")
 
-    def command_info_id(self, request: bytes | str) -> str:
+    def command_info_id(self, request: bytes | str) -> bytes:
         del request
         response = f"@PJL INFO ID\r\n{self.printer_id}\r\n\x1b"
         return self._response(response)
 
-    def command_info_status(self, request: bytes | str) -> str:
+    def command_info_status(self, request: bytes | str) -> bytes:
         del request
-        response = (
-            f"@PJL INFO STATUS\r\nCODE={self.code}\r\n"
-            f'DISPLAY="{self.ready_msg}"\r\nONLINE={self.online}'
-        )
+        response = f'@PJL INFO STATUS\r\nCODE={self.code}\r\nDISPLAY="{self.ready_msg}"\r\nONLINE={self.online}'
         return self._response(response)
 
-    def command_rdymsg(self, request: bytes | str) -> str:
+    def command_rdymsg(self, request: bytes | str) -> bytes:
         request_parameters = self.get_parameters(request)
         rdymsg = request_parameters.get("DISPLAY")
         if rdymsg is None:
@@ -524,12 +532,12 @@ class Printer:
             "Ready message changed",
             extra={"action": "request", "event": "rdymsg", "rdymsg": self.ready_msg},
         )
-        return ""
+        return b""
 
-    def command_ustatusoff(self, request: bytes | str) -> str:
+    def command_ustatusoff(self, request: bytes | str) -> bytes:
         del request
         self.logger.info("Status updates disabled", extra={"action": "request", "event": "ustatusoff"})
-        return ""
+        return b""
 
     def save_postscript(self) -> str | None:
         data = bytes(self.postscript_data)

@@ -17,27 +17,33 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH"
 
-RUN addgroup -g 1000 -S miniprint && adduser -S -D -H -u 1000 -G miniprint miniprint
+# T-Pot runs miniprint and owns its data volumes as 2000:2000:
+# https://github.com/telekom-security/tpotce/blob/master/docker/miniprint/Dockerfile
+ARG MINIPRINT_UID=2000
+ARG MINIPRINT_GID=2000
+RUN addgroup -g ${MINIPRINT_GID} -S miniprint \
+    && adduser -S -D -H -u ${MINIPRINT_UID} -G miniprint miniprint
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
 COPY . .
-RUN mkdir -p /app/log /app/uploads /tmp/miniprint \
-    && chown -R miniprint:miniprint /app/log /app/uploads /tmp/miniprint
+RUN mkdir -p /app/log /app/uploads \
+    && chown -R miniprint:miniprint /app/log /app/uploads
 
 USER miniprint
 
 EXPOSE 9100 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD MINIPRINT_HEALTHCHECK=1 /app/.venv/bin/python ./server.py --pjl-port 9100 --http-port 8080 || exit 1
+  CMD MINIPRINT_HEALTHCHECK=1 /app/.venv/bin/python ./server.py || exit 1
 
 CMD [ \
   "/app/.venv/bin/python", "./server.py", \
   "--bind", "0.0.0.0", \
   "--log-file", "log/miniprint.json", \
   "--timeout", "60", \
+  "--session-timeout", "300", \
   "--max-connections", "16", \
   "--max-request-bytes", "65536", \
   "--max-job-bytes", "1048576", \

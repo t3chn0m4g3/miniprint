@@ -12,6 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from connection_limits import ConnectionLimitedMixIn
+from telemetry import ContextLoggerAdapter, format_utc
+
 
 DEVICE_PROFILE = {
     "manufacturer": "Brother",
@@ -36,21 +39,8 @@ ADMIN_PATHS = {"/admin", "/admin/config", "/web/admin/config", "/network/config"
 FIRMWARE_PATHS = {"/firmware", "/firmware/update", "/admin/firmware", "/web/admin/firmware"}
 
 
-def format_utc(value: datetime) -> str:
-    return value.isoformat().replace("+00:00", "Z")
-
-
-class ContextLoggerAdapter(logging.LoggerAdapter):
-    def process(self, msg: str, kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        base_extra = dict(self.extra)
-        call_extra = kwargs.get("extra")
-        if call_extra:
-            base_extra.update(call_extra)
-        kwargs["extra"] = base_extra
-        return msg, kwargs
-
-
-class WebAdminServer(ThreadingHTTPServer):
+class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
+    protocol = "http"
     daemon_threads = True
 
     def __init__(
@@ -59,10 +49,17 @@ class WebAdminServer(ThreadingHTTPServer):
         handler_class: type[BaseHTTPRequestHandler],
         logger: logging.Logger,
         max_request_bytes: int,
+        *,
+        max_connections: int = 16,
+        connection_slots: threading.BoundedSemaphore | None = None,
+        handler_timeout: float = 15,
     ) -> None:
         self.logger = logger
         self.max_request_bytes = max_request_bytes
-        self.connection_lock = threading.Lock()
+        self.handler_timeout = handler_timeout
+        self.connection_slots = (
+            connection_slots if connection_slots is not None else threading.BoundedSemaphore(max_connections)
+        )
         super().__init__(server_address, handler_class)
 
 
@@ -71,6 +68,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def setup(self) -> None:
+        self.timeout = self.server.handler_timeout
         super().setup()
         self.session_id = str(uuid.uuid4())
         self.session_start = datetime.now(UTC)
@@ -89,6 +87,29 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 "protocol": "http",
             },
         )
+
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        finally:
+            if getattr(self, "raw_requestline", b""):
+                self.request_seen = True
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            # Suppress empty health checks; complete parsed and malformed requests alike.
+            if getattr(self, "request_seen", False):
+                self.log.info(
+                    "HTTP connection closed",
+                    extra=self._session_end_extra(
+                        {
+                            "action": "close_conn",
+                            "event": "http_connection_closed",
+                        }
+                    ),
+                )
 
     def log_message(self, fmt: str, *args: Any) -> None:
         self.log.debug(
@@ -110,7 +131,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> bytes:
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
+            content_length = max(0, int(self.headers.get("Content-Length", "0")))
         except ValueError:
             content_length = 0
         if content_length > self.server.max_request_bytes:
@@ -168,7 +189,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         finally:
             self.log.info(
                 "HTTP request completed",
-                extra=self._session_end_extra({"action": "close_conn", "event": "http_connection_closed"}),
+                extra={"action": "request_completed", "event": "http_request_completed"},
             )
 
     def _session_end_extra(self, extra: dict[str, Any]) -> dict[str, Any]:
@@ -231,7 +252,9 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             "Login attempt observed",
             extra={
                 "action": "auth",
-                "event": "default_password_probe" if username.lower() in {"admin", "administrator"} else "login_attempt",
+                "event": "default_password_probe"
+                if username.lower() in {"admin", "administrator"}
+                else "login_attempt",
                 "username": username[:64],
                 "secret_supplied": secret_supplied,
                 "cve_hint": "CVE-2024-51978",
@@ -332,5 +355,17 @@ def create_http_server(
     address: tuple[str, int],
     logger: logging.Logger,
     max_request_bytes: int,
+    *,
+    max_connections: int = 16,
+    connection_slots: threading.BoundedSemaphore | None = None,
+    handler_timeout: float = 15,
 ) -> WebAdminServer:
-    return WebAdminServer(address, WebAdminHandler, logger, max_request_bytes)
+    return WebAdminServer(
+        address,
+        WebAdminHandler,
+        logger,
+        max_request_bytes,
+        max_connections=max_connections,
+        connection_slots=connection_slots,
+        handler_timeout=handler_timeout,
+    )

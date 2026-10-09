@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
+import socket
+import time
 import threading
 import unittest
 import uuid
 from http.client import HTTPConnection
 from urllib.parse import urlencode
+from unittest.mock import patch
 
-from web_admin import create_http_server
+from web_admin import create_http_server, WebAdminHandler
 
 
 class ListHandler(logging.Handler):
@@ -54,11 +57,65 @@ class WebAdminTestCase(unittest.TestCase):
         finally:
             connection.close()
 
+    def wait_for_event(self, event: str, count: int = 1) -> None:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if self.events().count(event) >= count:
+                return
+            time.sleep(0.01)
+        self.fail(f"Missing {event}: {self.events()}")
+
     def events(self) -> list[str | None]:
         return [getattr(record, "event", None) for record in self.handler.records]
 
     def hints(self) -> str:
         return ",".join(str(getattr(record, "cve_hint", "")) for record in self.handler.records)
+
+    def test_negative_content_length_does_not_wait_for_eof(self) -> None:
+        with socket.create_connection((self.host, self.port), timeout=1) as sock:
+            sock.sendall(b"POST /login HTTP/1.0\r\nContent-Length: -1\r\n\r\n")
+            sock.settimeout(0.5)
+            self.assertIn(b"401", sock.recv(4096))
+
+    def test_http_idle_timeout_releases_slot(self) -> None:
+        self.server.handler_timeout = 0.1
+        with socket.create_connection((self.host, self.port), timeout=1) as sock:
+            sock.settimeout(1)
+            self.assertEqual(sock.recv(4096), b"")
+        status, _ = self.request("/")
+        self.assertEqual(status, 200)
+
+    def test_http_limit_rejects_before_spawning_thread(self) -> None:
+        self.server.connection_slots = threading.BoundedSemaphore(1)
+        self.assertTrue(self.server.connection_slots.acquire(blocking=False))
+        try:
+            with socket.create_connection((self.host, self.port), timeout=1) as sock:
+                sock.settimeout(1)
+                self.assertEqual(sock.recv(4096), b"")
+            self.wait_for_event("connection_limit")
+        finally:
+            self.server.connection_slots.release()
+        status, _ = self.request("/")
+        self.assertEqual(status, 200)
+
+    def test_keepalive_has_one_session_end_for_multiple_requests(self) -> None:
+        with patch.object(WebAdminHandler, "protocol_version", "HTTP/1.1"):
+            connection = HTTPConnection(self.host, self.port, timeout=2)
+            try:
+                for path in ("/", "/status"):
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    response.read()
+                self.wait_for_event("http_request_completed", count=2)
+                completed = [r for r in self.handler.records if r.event == "http_request_completed"]
+                self.assertEqual(len(completed), 2)
+                self.assertFalse(any(hasattr(r, "session_end") for r in completed))
+            finally:
+                connection.close()
+            self.wait_for_event("http_connection_closed")
+        self.assertEqual(sum(hasattr(r, "session_end") for r in self.handler.records), 1)
+        self.assertEqual(len({r.session_id for r in self.handler.records}), 1)
 
     def test_status_page_exposes_printer_signals(self) -> None:
         status, body = self.request("/")
@@ -72,6 +129,7 @@ class WebAdminTestCase(unittest.TestCase):
         status, _ = self.request("/", headers={"User-Agent": "curl/8.0"})
         self.assertEqual(status, 200)
 
+        self.wait_for_event("http_connection_closed")
         request_record = next(record for record in self.handler.records if record.event == "device_info_probe")
         close_record = next(record for record in self.handler.records if record.event == "http_connection_closed")
         self.assertEqual(request_record.src_ip, "127.0.0.1")
