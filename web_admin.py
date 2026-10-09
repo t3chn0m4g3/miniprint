@@ -29,6 +29,9 @@ from printer import Printer
 
 
 SSRF_PARAMETERS = {"url", "uri", "target", "server", "dest", "callback", "address", "host"}
+# Form names are attacker-chosen; log them as values so they never become schema keys.
+MAX_FORM_FIELDS = 32
+MAX_FORM_FIELD_NAME = 64
 
 
 class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
@@ -436,18 +439,31 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             )
             return
         sensitive = any(self._secret_key(key) and any(value) for key, value in params.items())
+        target_keys = [key for key in params if "server" in key.lower() or "host" in key.lower()]
         event = (
             "passback_attempt"
-            if any(part in path.lower() for part in ("ldap", "smtp"))
-            and any("server" in key.lower() or "host" in key.lower() for key in params)
+            if any(part in path.lower() for part in ("ldap", "smtp")) and target_keys
             else "admin_settings_saved"
         )
-        safe = {key: values for key, values in self._safe_params(params).items() if not self._secret_key(key)}
+        safe_params = self._safe_params(params)
+        form_fields = [
+            {"name": key[:MAX_FORM_FIELD_NAME], "value": value}
+            for key, values in safe_params.items()
+            if not self._secret_key(key)
+            for value in values
+        ][:MAX_FORM_FIELDS]
+        passback_target = None
+        if event == "passback_attempt":
+            passback_target = next(
+                (value for key in target_keys if not self._secret_key(key) for value in safe_params[key] if value),
+                None,
+            )
         self.log.info(
             "Admin settings received",
             extra={
                 "event": event,
-                "fields": safe,
+                "form_fields": form_fields,
+                "passback_target": passback_target,
                 "secret_supplied": sensitive,
                 "cve_hint": self.server.persona.cve_hints.get(event),
             },

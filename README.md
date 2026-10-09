@@ -143,6 +143,8 @@ uses `http_connection_closed` or `connection_limit`. Each HTTP request emits
 | `language` | Selected print language |
 | `cve_hint` | Comma-separated hints from the selected persona |
 | `secret_supplied` | Boolean; no plaintext credential |
+| `form_fields` | Admin form fields as `name`/`value` pairs, secrets omitted, at most 32 |
+| `passback_target` | First non-empty server or host value of a `passback_attempt` |
 
 Artifact events include `save_print_job`, `save_raw_print_job`,
 `save_postscript` and `save_firmware`, with `file_name`, hash and byte `size`.
@@ -166,12 +168,12 @@ are represented by purpose-specific fields such as `artifact_size` and
 
 ## T-Pot integration
 
-T-Pot's standard Compose profile already publishes Snare on host port 80. To
-expose miniprint on port 80, first adjust that deployment's port ownership or
-provide a separate IP; the local Compose file is not a drop-in addition.
-T-Pot's existing miniprint image uses UID/GID 2000 and `/opt/miniprint` paths;
-this image uses `/app`. Update log, upload and state volume targets accordingly.
-The local Docker 29.8.2 runtime supports non-root binding on port 80 with all
+T-Pot builds its own image from a release tag, with UID/GID 2000 and
+`/opt/miniprint` paths. Its host port 80 belongs to h0neytr4p, so T-Pot starts
+miniprint with `--http-port 8000` and publishes ports 9100 and 8000. Log, upload
+and state directories are `${TPOT_DATA_PATH}/miniprint/{log,uploads,data}`.
+The local Compose file of this repository uses port 80 and is not a drop-in
+addition to T-Pot. Docker allows non-root binding on port 80 with all
 capabilities dropped; set `net.ipv4.ip_unprivileged_port_start=0` in deployment
 sysctls if another runtime requires it.
 

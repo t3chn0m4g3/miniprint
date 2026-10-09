@@ -89,6 +89,30 @@ def test_serial_login_passback_firmware_chain(web):
     assert password not in logs
     assert "PRIVATE-SECRET" not in logs
     assert any(getattr(r, "secret_supplied", False) for r in records)
+    passback = next(r for r in records if r.event == "passback_attempt")
+    assert passback.form_fields == [{"name": "server", "value": "ldap.example.test"}]
+    assert passback.passback_target == "ldap.example.test"
+    assert not hasattr(passback, "fields")
+
+
+def test_form_fields_are_bounded(web):
+    server, records, _ = web
+    cookie, _ = login(server)
+    params = [("k" * 100, "v" * 300)] + [(f"f{index}", "v") for index in range(40)]
+    assert request(server, "/admin/network", urlencode(params), cookie)[0] == 200
+    saved = next(r for r in records if r.event == "admin_settings_saved")
+    assert len(saved.form_fields) == 32
+    assert saved.form_fields[0] == {"name": "k" * 64, "value": "v" * 256}
+    assert saved.passback_target is None
+
+
+def test_passback_target_skips_ports_and_empty_hosts(web):
+    server, records, _ = web
+    cookie, _ = login(server)
+    params = [("port", "25"), ("smtp_host", ""), ("smtp_server", "mail.example.test")]
+    assert request(server, "/admin/smtp", urlencode(params), cookie)[0] == 200
+    passback = next(r for r in records if r.event == "passback_attempt")
+    assert passback.passback_target == "mail.example.test"
 
 
 def test_cookie_expiry_wrong_password_and_upload_limit(web):
