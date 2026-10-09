@@ -1,6 +1,6 @@
 # Validierung der Phasen 2–6
 
-Stand: 2026-10-09. Lokal geprüft, noch nicht veröffentlicht.
+Stand: 2026-10-09. Lokal geprüft und nach ausdrücklicher Nutzerfreigabe veröffentlicht.
 
 ## Automatisierte Prüfungen
 
@@ -86,5 +86,6 @@ beim Replay als fehlend gemeldet werden; neue Replay-Artefakte bleiben vorhanden
 
 ## Veröffentlichung
 
-Alle Änderungen sind lokal committet. Die aktualisierte PR-Beschreibung ist in
-[ewsposter-pr18-body.md](../ewsposter-pr18-body.md) vorbereitet. Für beide Pushes und die Aktualisierung von PR #18 ist eine ausdrückliche Zustimmung erforderlich.
+Die ausdrückliche Zustimmung wurde am 2026-10-09 erteilt. Beide Branches sind
+gepusht und PR #18 ist aktualisiert. Die veröffentlichte Beschreibung liegt in
+[ewsposter-pr18-body.md](../ewsposter-pr18-body.md).

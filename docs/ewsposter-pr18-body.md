@@ -1,6 +1,6 @@
 Align `honeypots/miniprint.py` with the completed 2026 miniprint lure schema.
-The miniprint implementation is currently on local branch `lure-2026`; publishing
-that branch and updating this PR are pending owner approval.
+The miniprint implementation is published on branch
+[`lure-2026`](https://github.com/t3chn0m4g3/miniprint/tree/lure-2026).
 
 ## Changes
 
