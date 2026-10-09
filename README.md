@@ -1,247 +1,201 @@
 # miniprint
 
-<img align="right" width="212" height="288" src="https://user-images.githubusercontent.com/3712226/54886937-78f7b180-4e5b-11e9-8ccc-18716f2b5a3b.png">
+A medium interaction printer honeypot for PJL on TCP 9100 and an embedded web
+administration interface on TCP 80. It captures printer payloads and records
+probes as newline-delimited JSON. Device configuration changes are simulated;
+admin, LDAP, SMTP and SSRF handlers do not open outbound connections.
 
-miniprint is a medium-interaction printer honeypot. It exposes a raw
-JetDirect/PJL printer service and a passive web-admin surface that looks like a
-network printer accidentally exposed to the internet.
-
-The honeypot is intentionally complementary to IPP-focused honeypots such as
-IPPHoney: miniprint does not listen on IPP/631.
-
-## What It Emulates
-
-| Surface | Default port | Behavior |
-|:--|:--|:--|
-| Raw/JetDirect | `9100/tcp` | PJL commands, virtual filesystem, raw jobs, PostScript capture |
-| Web admin | `8080/tcp` in the container, `80/tcp` via Compose | Passive status pages, device info, login probes, admin/config probes |
-| IPP | Not exposed | Use a dedicated IPP honeypot instead |
-
-PJL support includes `ECHO`, `USTATUSOFF`, `INFO ID`, `INFO STATUS`,
-`FSDIRLIST`, `FSQUERY`, `FSMKDIR`, `FSUPLOAD`, `FSDOWNLOAD`, `FSAPPEND`,
-`FSDELETE`, `FSINIT`, and `RDYMSG`.
-
-The HTTP surface recognizes interesting printer attack probes and logs them with
-CVE-style hints. It never performs outbound requests, real authentication
-bypass, firmware parsing, or PostScript execution.
-
-## Run With Docker
-
-Docker Compose is the recommended production path:
+## Run
 
 ```bash
 docker compose up -d --build
 ```
 
-This publishes:
+The container runs as UID/GID 2000, with a read-only root filesystem, dropped
+capabilities, `no-new-privileges`, 256 MiB memory, one CPU and 128 PIDs. Build
+arguments `MINIPRINT_UID` and `MINIPRINT_GID` override ownership. On Linux,
+bind-mounted directories must be writable by those IDs.
 
-```text
-9100/tcp -> raw PJL printer
-80/tcp   -> fake web-admin surface
-```
+| Host path | Container path | Content |
+|---|---|---|
+| `log/` | `/app/log/` | `miniprint.json` |
+| `uploads/` | `/app/uploads/` | Captured jobs and firmware |
+| `data/` | `/app/data/` | Persistent `identity.json` |
 
-Runtime output is written to:
+The healthcheck reads the running server arguments from `/proc/1/cmdline`,
+respects custom ports and `--no-http`, and probes loopback only. Empty loopback
+health checks do not generate session events.
 
-```text
-log/miniprint.json
-uploads/
-```
+## Personas and identity
 
-The container is built on Python 3.14, runs as a non-root user, uses a read-only
-root filesystem, drops Linux capabilities, uses `no-new-privileges`, and has a
-healthcheck for both exposed services.
+Use `--persona brother`, `hp`, `lexmark`, or `random`; the default is `random`.
+`MINIPRINT_PERSONA` supplies the default for CLI and Compose, and an explicit CLI
+flag takes precedence.
 
-The Docker image starts miniprint with explicit conservative application limits:
+| Persona | Model | HTTP banner |
+|---|---|---|
+| Brother | MFC-L9570CDW | `Debut/1.30` |
+| HP | LaserJet 4200 | `HP-ChaiServer/3.0` |
+| Lexmark | MX521ade | `Lexmark_Web_Server` |
 
-| Limit | Docker value |
-|:--|--:|
-| Connection timeout | `60s` |
-| Total concurrent PJL and HTTP connections | `16` |
-| PJL session deadline | `300s` |
-| HTTP socket timeout | `15s` |
-| Request size | `65,536 bytes` |
-| Print/PostScript job artifact | `1,048,576 bytes` |
-| Virtual filesystem file | `262,144 bytes` |
-| Response size | `131,072 bytes` |
+The first random selection and the generated serial, hostname, MAC suffix and
+firmware are stored in `--state-dir` (default `data/`). Restarts retain that
+identity. Delete `identity.json` or use `--reroll-identity` to generate another.
+Selecting a different fixed persona replaces the stored identity. An unwritable
+state directory produces a console warning and an identity held only in memory.
 
-Compose additionally caps the container at `1` CPU, `256m` memory, `128` PIDs,
-and a conservative `nofile` ulimit. `nproc` is intentionally not set because it
-can be evaluated against the host UID's total process count before the app even
-starts.
+HTTP, PJL and seed filesystem content use the same device profile. Banners and
+routes have source references in `personas.py`; the profiles approximate device
+behavior and do not emulate every firmware endpoint.
 
-The Dockerfile is multiarch-ready for `linux/amd64` and `linux/arm64`. Those are
-the platforms shared by the pinned Python base image and the pinned `uv` image.
+Virtual files, variables and ready messages remain available across reconnects
+from the same source IP. This state is held in memory, with a 24-hour idle TTL
+and an LRU limit of 256 sources. Restarting clears it. Commands are synchronized
+per source; `FSINIT` resets only that source's virtual filesystem.
 
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 -t miniprint:latest .
-```
+## Protocols and limits
 
-The container healthcheck performs local TCP checks against the PJL and HTTP
-listeners, using the running server arguments from `/proc/1/cmdline`; `--no-http`
-disables the HTTP probe and custom ports are honored. Empty loopback connections are filtered so routine healthchecks do
-not fill `log/miniprint.json` with connection open/close events.
+PJL supports filesystem commands, INFO ID/STATUS/CONFIG/VARIABLES/FILESYS/MEMORY/
+PAGECOUNT/PRODINFO, Brother BRFIRMWARE, INQUIRE/DINQUIRE/SET/DEFAULT, JOB/EOJ,
+ECHO, USTATUSOFF, RDYMSG and simulated RNVRAM bytes. Filesystem operations use
+pyfakefs, without access to host files.
 
-The image defaults to UID/GID `2000:2000` for T-Pot data volumes. Override these
-with Docker build arguments `MINIPRINT_UID` and `MINIPRINT_GID` when needed.
-Existing Linux bind mounts must be writable by the configured UID/GID.
+`@PJL ENTER LANGUAGE=POSTSCRIPT`, `PCL`, `PCLXL` or `PDF` captures bytes through
+the next UEL (`ESC%-12345X`) or EOF. Other languages use `.prn`. Delimiters may
+cross TCP chunks; binary bodies may contain PJL-like text. A standalone `%!`
+stream is captured as PostScript. Captured artifacts use time/hash filenames,
+never attacker-supplied host paths.
 
-## Local Development
+| Limit | Default |
+|---|---:|
+| Total concurrent HTTP and PJL connections | 16 |
+| PJL idle timeout (`--timeout`) | 60 s |
+| PJL total deadline (`--session-timeout`) | 300 s |
+| HTTP socket timeout | 15 s |
+| PJL command bytes / ordinary HTTP body (`--max-request-bytes`) | 65,536 |
+| Cumulative print-job bytes / firmware body (`--max-job-bytes`) | 1,048,576 |
+| Each virtual file (`--max-virtual-file-bytes`) | 262,144 |
+| Each command response (`--max-response-bytes`) | 131,072 |
 
-This repository uses `uv` directly. `pyproject.toml` is the source of dependency
-truth and `uv.lock` pins the resolved versions. The old `requirements*.txt`
-workflow is intentionally not kept in parallel.
+The hard PJL connection byte limit is command bytes plus job bytes. Limit events
+close PJL connections and preserve captured job prefixes. Oversized HTTP bodies
+receive 413. FSUPLOAD returns FILEERROR=1 if the complete reply exceeds the
+response limit, so its advertised SIZE always matches the binary body.
+
+HTTP uses HTTP/1.1, a single persona Server header and device-themed error pages.
+Keep-Alive requests share a connection/session ID.
+
+## Brother lure chain
+
+For the Brother persona only:
+
+1. `GET /etc/mnt_info.csv` exposes model, `Serial No.` and node name.
+2. Derive the default password locally with `brother.brother_default_password`.
+3. POST `username=admin&password=...` to `/login`, or POST the password from the
+   `LogBox` form to `/general/status.html`. A successful login sets `AuthCookie`.
+4. Visit `/admin/network`, `/admin/ldap`, `/admin/smtp`, `/admin/snmp` and
+   `/admin/firmware`. Settings POSTs return `saved`. LDAP/SMTP server changes
+   generate passback events. Firmware POSTs capture raw or multipart file data.
+5. A nonnumeric `@PJL SET FORMLINES=...` closes the PJL connection and simulates
+   a 60–120 second reboot for that source IP across HTTP and PJL.
+
+Cookies expire after 30 minutes, are bound to the source IP, and are limited to
+1024 in-memory sessions. Passwords and secret form values are omitted from
+logs; `secret_supplied` records whether a secret was supplied.
+
+The password implementation uses the official Metasploit default salt index
+254. Tests use vectors independently checked against that Ruby routine. The
+serial in Rapid7's published worked example is masked, so it cannot serve as an
+unmasked test vector.
+
+| Event | CVE hint | Persona |
+|---|---|---|
+| `serial_leak_probe` | CVE-2024-51977 | Brother |
+| `default_password_probe`, `default_password_success` | CVE-2024-51978 | Brother |
+| `pjl_crash_probe` | CVE-2024-51982 | Brother |
+| `passback_attempt` | CVE-2024-51984 | Brother |
+| `path_traversal_probe` | CVE-2025-1127 | Lexmark |
+| `ssrf_probe` | CVE-2025-9269 | Lexmark |
+
+CVE hints classify observed lure behavior; they do not claim a real firmware
+vulnerability. WSD CVEs are not assigned to arbitrary HTTP URL parameters.
+SNMP, LPD, WSD and IPP listeners are outside this implementation.
+
+## Log schema
+
+`log/miniprint.json` is JSONL. Session records contain `session_id`, `src_ip`,
+`src_port`, `dest_ip`, `dest_port`, `session_start`, `protocol` and `persona`.
+Null fields are omitted. Lifecycle events (`server_start`, `server_stop`,
+`signal`, `identity_ephemeral`) are console-only.
+
+Each logged connection ends once with `session_end` and `session_duration`:
+PJL uses `connection_closed`, `empty_connection`, or `connection_limit`; HTTP
+uses `http_connection_closed` or `connection_limit`. Each HTTP request emits
+`http_request_completed` without `session_end`.
+
+| Field | Meaning |
+|---|---|
+| `virtual_path` | Path inside the fake filesystem |
+| `file_name` | Artifact basename in `uploads/` |
+| `payload_sha256` | SHA-256 of the command or saved payload |
+| `payload_preview` | Bounded preview, with HTTP secrets redacted |
+| `artifact_type` | `ps`, `pcl`, `pdf`, `raw`, or `firmware` |
+| `language` | Selected print language |
+| `cve_hint` | Comma-separated hints from the selected persona |
+| `secret_supplied` | Boolean; no plaintext credential |
+
+Artifact events include `save_print_job`, `save_raw_print_job`,
+`save_postscript` and `save_firmware`, with `file_name`, hash and byte `size`.
+`command_error` includes `error_type`, command hash and preview, while the
+session continues. `session_error`, `artifact_error`, `http_error`,
+`session_timeout`, `request_too_large`, `job_too_large`, `connection_too_large`
+and `reboot_suppressed` explain failures or controlled closure.
+
+Breaking changes: HTTP now listens on container port 80; identity state needs
+its own writable volume; command responses are bytes; virtual paths use
+`virtual_path`; HTTP request completion and connection closure are separate;
+UID/GID defaults are 2000; persona selection defaults to a persisted random
+choice. Consumers must aggregate by session ID through `session_end`.
+
+The updated ewsposter adapter preserves open sessions across polling runs,
+deduplicates completed sessions, skips empty connections by default
+(`send_empty_connections = false`) and selects firmware before document before
+raw artifacts. All artifacts are listed in additional data. `size` and `limit`
+are represented by purpose-specific fields such as `artifact_size` and
+`request_too_large_size`.
+
+## T-Pot integration
+
+T-Pot's standard Compose profile already publishes Snare on host port 80. To
+expose miniprint on port 80, first adjust that deployment's port ownership or
+provide a separate IP; the local Compose file is not a drop-in addition.
+T-Pot's existing miniprint image uses UID/GID 2000 and `/opt/miniprint` paths;
+this image uses `/app`. Update log, upload and state volume targets accordingly.
+The local Docker 29.8.2 runtime supports non-root binding on port 80 with all
+capabilities dropped; set `net.ipv4.ip_unprivileged_port_start=0` in deployment
+sysctls if another runtime requires it.
+
+## Development and verification
 
 ```bash
 uv sync
-uv run python ./server.py
-```
-
-Useful development checks from the repository root:
-
-```bash
+uv run python server.py --bind 127.0.0.1 --http-port 8080 --persona brother
+uv run python server.py --no-http --persona hp
+uv run python server.py --help
 uv run pytest
 uv run ruff check .
-uv run bandit -c pyproject.toml -r .
-uv export --locked --no-dev --no-emit-project --format requirements.txt -o /tmp/miniprint-runtime.txt
-uv run pip-audit -r /tmp/miniprint-runtime.txt
 ```
 
-`pytest` is configured to discover tests from `tests/`, so the root command
-above is enough.
-
-## CLI
-
-```text
-usage: miniprint [-h] [-b HOST] [--pjl-port PJL_PORT] [--http-port HTTP_PORT]
-                 [--no-http] [-l LOG_FILE] [-t TIMEOUT]
-                 [--session-timeout SESSION_TIMEOUT] [--uploads-dir UPLOADS_DIR]
-                 [--max-connections MAX_CONNECTIONS]
-                 [--max-request-bytes MAX_REQUEST_BYTES]
-                 [--max-job-bytes MAX_JOB_BYTES]
-                 [--max-virtual-file-bytes MAX_VIRTUAL_FILE_BYTES]
-                 [--max-response-bytes MAX_RESPONSE_BYTES]
-```
-
-Examples:
+Run the opt-in smoke suite against a built, running container:
 
 ```bash
-uv run python ./server.py --bind 0.0.0.0 --log-file log/miniprint.json
-uv run python ./server.py --bind 127.0.0.1 --no-http
-uv run python ./server.py --max-job-bytes 1048576 --max-connections 16
+MINIPRINT_CONTAINER_SMOKE=1 uv run pytest tests/test_container_smoke.py
 ```
 
-To interact with the PJL surface manually, PRET can be used:
+For an isolated container, set `MINIPRINT_CONTAINER`, `MINIPRINT_PJL_PORT`,
+`MINIPRINT_HTTP_PORT`, `MINIPRINT_LOG_FILE` and `MINIPRINT_UPLOADS_DIR`. The
+Brother-chain smoke test requires that container to use `--persona brother`.
+PRET can exercise `id`, `info config`, `env`, `ls`, `put` and reconnects.
 
-```bash
-python ./pret.py localhost pjl
-```
-
-## Logging And Artifacts
-
-Logs are newline-delimited JSON. Events include connection context and
-classification metadata. Fields with no value are omitted rather than logged as
-`null`. Connection-scoped events use canonical source, destination, and session
-fields such as:
-
-```json
-{
-  "timestamp": "2026-06-16T11:00:00.000000Z",
-  "info": "HTTP request received",
-  "session_id": "...",
-  "src_ip": "203.0.113.10",
-  "src_port": 52144,
-  "dest_ip": "198.51.100.20",
-  "dest_port": 8080,
-  "session_start": "2026-06-16T11:00:00.000000Z",
-  "protocol": "http",
-  "user_agent": "curl/8.0",
-  "event": "ssrf_probe",
-  "cve_hint": "CVE-2024-51980,CVE-2024-51981,CVE-2025-9269"
-}
-```
-
-### Log schema
-
-Each logged connection has one terminal event with `session_end` and
-`session_duration`: `connection_closed`, `empty_connection`,
-`http_connection_closed`, or `connection_limit`. Empty loopback health checks
-are suppressed. HTTP requests emit `http_request_completed` without
-`session_end`; the HTTP connection closes separately, including on errors.
-This replaces the former HTTP close event emitted per request.
-
-`command_error` records a failed PJL command's `error_type`, `payload_sha256`,
-and `payload_preview`; subsequent commands can still run. `session_timeout`
-marks the PJL total deadline. `session_error` and `artifact_error` record
-unexpected session or artifact failures with `error_type` and are followed
-by the terminal connection event.
-
-Lifecycle/control events such as `server_start`, `signal`, and `server_stop`
-are emitted to the console, including Docker logs, but are intentionally not
-written to `log/miniprint.json`. The file log also omits the generic logging
-`level` field so analysts can focus on protocol, action, event, source,
-destination, and payload correlation fields.
-
-Full attacker-supplied files and print jobs are not copied into the log. They
-are stored under `uploads/` with timestamp/hash-based filenames. Logs contain
-payload hashes and short previews for correlation.
-
-## Safety Model
-
-miniprint is a passive emulator. The web surface is designed to look
-interesting to scanners and opportunistic attackers while keeping host risk low:
-
-* SSRF-looking parameters are detected and logged, but no outbound request is made.
-* Login/default-password attempts are logged, but no real session is issued.
-* Firmware and PostScript probes are classified, but never parsed or executed.
-* PJL file operations, including append, delete, and init, are confined to an
-  in-memory fake filesystem.
-* Request, response, virtual file, and print-job sizes are bounded.
-
-## Maintenance Notes
-
-Dependency updates:
-
-```bash
-uv lock --upgrade
-uv sync
-uv run pytest
-```
-
-Docker verification:
-
-```bash
-docker compose build
-docker compose config
-docker buildx build --platform linux/amd64,linux/arm64 -t miniprint:latest .
-```
-
-Running-container smoke test:
-
-```bash
-docker compose up -d --build
-MINIPRINT_CONTAINER_SMOKE=1 uv run pytest tests/test_container_smoke.py -q
-```
-
-The smoke test expects a running container named `miniprint`, PJL on
-`127.0.0.1:9100`, HTTP on `127.0.0.1:80`, and logs at `log/miniprint.json`.
-Override those with `MINIPRINT_CONTAINER`, `MINIPRINT_HOST`,
-`MINIPRINT_PJL_PORT`, `MINIPRINT_HTTP_PORT`, and `MINIPRINT_LOG_FILE`.
-
-Protocol smoke checks:
-
-```bash
-printf '@PJL INFO ID\r\n' | nc 127.0.0.1 9100
-curl http://127.0.0.1/deviceinfo.xml
-```
-
-## Thanks
-
-* frbexiga at BinaryEdge
-* Jens Mueller for the hacking-printers.net wiki
-
-Print streams selected by `@PJL ENTER LANGUAGE=` are captured through UEL or EOF
-with `.ps`, `.pcl`, `.pdf`, or `.prn` suffixes. `save_print_job` includes `language`
-and `artifact_type`. PJL command bytes and print payload bytes have separate
-cumulative limits; `job_too_large` and `connection_too_large` close the session
-while retaining the captured prefix. Unknown commands are logged at info level
-with a name, SHA-256 and bounded preview.
+Runtime dependencies and development tools are declared in `pyproject.toml`
+and pinned by `uv.lock`. Python 3.14 and `uv` are required for local development.

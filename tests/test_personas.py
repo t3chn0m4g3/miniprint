@@ -92,6 +92,10 @@ def test_variables_default_and_info_families():
         response = printer.command_info("INFO " + family)
         assert response.startswith(("@PJL INFO " + family + "\r\n").encode())
         assert response.endswith(b"\r\n\x0c")
+        if family == "FILESYS":
+            # PRET skips the header and reads volume identifiers from subsequent rows.
+            assert response.splitlines()[1].startswith(b"VOLUME ")
+            assert response.splitlines()[2].startswith(b"0:")
 
 
 def test_http_profiles_headers_and_error_pages(tmp_path):

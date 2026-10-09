@@ -42,7 +42,7 @@ class Persona:
     def info(self, family: str, identity: Identity) -> str:
         values = {
             "CONFIG": f'MODEL="{self.model}"\r\nLANGUAGES=3\r\nPCL\r\nPOSTSCRIPT\r\nPDF',
-            "FILESYS": "VOLUME=0 TOTALSIZE=16777216 FREESIZE=12582912",
+            "FILESYS": "VOLUME TOTALSIZE FREESIZE LOCATION LABEL\r\n0: 16777216 12582912 RAM ",
             "MEMORY": "TOTAL=67108864\r\nLARGEST=33554432",
             "PAGECOUNT": "12457",
             "PRODINFO": f'MODEL="{self.model}"\r\nSERIALNUMBER="{identity.serial}"\r\nFIRMWARE="{identity.firmware}"',

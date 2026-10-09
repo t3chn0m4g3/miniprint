@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import http.client
 import json
 import os
@@ -198,7 +200,9 @@ def test_container_protocol_logging_and_request_limit() -> None:
 
         def observed(records: list[dict[str, Any]]) -> bool:
             return (
-                any(record.get("event") == "ssrf_probe" and record.get("user_agent") == user_agent for record in records)
+                any(
+                    record.get("event") == "ssrf_probe" and record.get("user_agent") == user_agent for record in records
+                )
                 and any(marker in record.get("payload_preview", "") for record in records)
                 and any(record.get("event") == "request_too_large" for record in records)
                 and any(record.get("event") in {"connection_closed", "http_connection_closed"} for record in records)
@@ -223,3 +227,64 @@ def test_container_protocol_logging_and_request_limit() -> None:
     assert limit_record["size"] > int(EXPECTED_CMD_LIMITS["--max-request-bytes"])
     assert terminal_record["session_end"].endswith("Z")
     assert terminal_record["session_duration"] >= 0
+
+
+def test_container_brother_chain_and_large_job_capture() -> None:
+    from brother import brother_default_password
+
+    marker = uuid.uuid4().hex
+    offset = _log_offset()
+    before = _upload_snapshot()
+    try:
+        connection = http.client.HTTPConnection(HOST, HTTP_PORT, timeout=3)
+        try:
+            connection.request("GET", "/etc/mnt_info.csv")
+            response = connection.getresponse()
+            assert response.status == 200
+            serial = list(csv.DictReader(io.StringIO(response.read().decode())))[0]["Serial No."]
+            assert response.version == 11
+            assert len([v for k, v in response.getheaders() if k.lower() == "server"]) == 1
+            from urllib.parse import urlencode
+
+            body = urlencode({"username": "admin", "password": brother_default_password(serial)})
+            connection.request(
+                "POST", "/login", body=body, headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            cookie = response.getheader("Set-Cookie").split(";")[0]
+            response.read()
+            connection.request(
+                "POST",
+                "/admin/ldap",
+                body=urlencode({"server": marker + ".example.test", "password": "do-not-log-" + marker}),
+                headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            response.read()
+        finally:
+            connection.close()
+        payload = ("%!PS " + marker + "\n").encode() + b"x" * 500000
+        with socket.create_connection((HOST, PJL_PORT), timeout=3) as sock:
+            sock.sendall(b"\x1b%-12345X@PJL JOB\r\n@PJL ENTER LANGUAGE=POSTSCRIPT\r\n" + payload + b"\x1b%-12345X")
+            sock.shutdown(socket.SHUT_WR)
+            while sock.recv(4096):
+                pass
+        records = _wait_for_records(
+            offset,
+            lambda rows: (
+                any(row.get("event") == "save_print_job" for row in rows)
+                and any(row.get("event") == "passback_attempt" for row in rows)
+            ),
+        )
+        artifact = next(row for row in records if row.get("event") == "save_print_job")
+        assert (UPLOADS_DIR / artifact["file_name"]).read_bytes() == payload
+        assert artifact["language"] == "POSTSCRIPT" and artifact["artifact_type"] == "ps"
+        assert "do-not-log-" + marker not in repr(records)
+        assert all(row.get("persona") == "brother" for row in records)
+        http_sessions = {row["session_id"] for row in records if row.get("protocol") == "http"}
+        for sid in http_sessions:
+            assert sum("session_end" in row for row in records if row["session_id"] == sid) == 1
+    finally:
+        _remove_new_uploads(before)
