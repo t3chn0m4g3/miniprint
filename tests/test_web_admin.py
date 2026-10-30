@@ -85,6 +85,46 @@ class WebAdminTestCase(unittest.TestCase):
         status, _ = self.request("/")
         self.assertEqual(status, 200)
 
+    def test_http_deadline_closes_slow_headers_and_releases_slot(self) -> None:
+        self._assert_slow_request_deadline(b"GET / HTTP/1.1\r\nX-Slow: ")
+
+    def test_http_deadline_closes_slow_body_and_releases_slot(self) -> None:
+        self._assert_slow_request_deadline(b"POST /login HTTP/1.1\r\nContent-Length: 100\r\n\r\n")
+
+    def _assert_slow_request_deadline(self, prefix: bytes) -> None:
+        self.server.handler_timeout = 0.15
+        self.server.session_timeout = 0.2
+        self.server.connection_slots = threading.BoundedSemaphore(1)
+        with socket.create_connection((self.host, self.port), timeout=1) as sock:
+            sock.sendall(prefix)
+            deadline = time.monotonic() + 0.7
+            while time.monotonic() < deadline and "session_timeout" not in self.events():
+                try:
+                    sock.sendall(b"x")
+                except OSError:
+                    break
+                time.sleep(0.03)
+            self.assertIn("session_timeout", self.events())
+            self.wait_for_event("http_connection_closed")
+        self.assertTrue(self.server.connection_slots.acquire(timeout=1))
+        self.server.connection_slots.release()
+        self.assertEqual(self.request("/")[0], 200)
+        self.assertEqual(self.events().count("session_timeout"), 1)
+
+    def test_http_deadline_also_bounds_keepalive(self) -> None:
+        self.server.session_timeout = 0.15
+        connection = HTTPConnection(self.host, self.port, timeout=1)
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            response.read()
+            self.wait_for_event("session_timeout")
+            self.wait_for_event("http_connection_closed")
+            self.assertEqual(connection.sock.recv(1), b"")
+        finally:
+            connection.close()
+
     def test_http_limit_rejects_before_spawning_thread(self) -> None:
         self.server.connection_slots = threading.BoundedSemaphore(1)
         self.assertTrue(self.server.connection_slots.acquire(blocking=False))

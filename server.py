@@ -578,6 +578,7 @@ def serve(config: ServerConfig, logger: logging.Logger) -> None:
             device_store=device_store,
             uploads_dir=config.uploads_dir,
             max_job_bytes=config.max_job_bytes,
+            session_timeout=config.session_timeout,
         )
         servers.append(http_server)
 

@@ -65,8 +65,8 @@ PERSONAS = {
         ("ZL", "ZK", "ZJ"),
         {
             "serial_leak_probe": "CVE-2024-51977",
-            "default_password_probe": "CVE-2024-51978",
-            "default_password_success": "CVE-2024-51978",
+            "default_password_probe": "CVE-2024-51978",  # nosec B105 - CVE identifier, not a credential.
+            "default_password_success": "CVE-2024-51978",  # nosec B105 - CVE identifier, not a credential.
             "pjl_crash_probe": "CVE-2024-51982",
             "passback_attempt": "CVE-2024-51984",
         },

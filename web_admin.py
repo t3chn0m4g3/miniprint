@@ -7,6 +7,7 @@ import html
 import io
 import json
 import logging
+import socket
 import threading
 import time
 import uuid
@@ -47,6 +48,7 @@ class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
         max_connections: int = 16,
         connection_slots: threading.BoundedSemaphore | None = None,
         handler_timeout: float = 15,
+        session_timeout: float = 300,
         identity: Identity | None = None,
         device_store: DeviceStateStore | None = None,
         uploads_dir: str = "uploads",
@@ -78,6 +80,7 @@ class WebAdminServer(ConnectionLimitedMixIn, ThreadingHTTPServer):
         self.logger = ContextLoggerAdapter(logger, {"persona": self.persona.name})
         self.max_request_bytes = max_request_bytes
         self.handler_timeout = handler_timeout
+        self.session_timeout = session_timeout
         self.connection_slots = (
             connection_slots if connection_slots is not None else threading.BoundedSemaphore(max_connections)
         )
@@ -130,6 +133,26 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 "protocol": "http",
             },
         )
+        self._deadline_lock = threading.Lock()
+        self._finished = False
+        self._deadline_timer = threading.Timer(self.server.session_timeout, self._expire_session)
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def _expire_session(self) -> None:
+        with self._deadline_lock:
+            if self._finished:
+                return
+            self.request_seen = True
+            self.close_connection = True
+            self.log.warning("HTTP session deadline reached", extra={"event": "session_timeout", "action": "timeout"})
+            try:
+                self.request.shutdown(socket.SHUT_RDWR)
+            except OSError as exc:
+                self.log.debug(
+                    "HTTP connection already closed",
+                    extra={"event": "http_shutdown_failed", "error_type": type(exc).__name__},
+                )
 
     def handle_one_request(self) -> None:
         device = self.server.device_store.get(self.client_address[0])
@@ -154,6 +177,9 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                     )
 
     def finish(self) -> None:
+        with self._deadline_lock:
+            self._finished = True
+            self._deadline_timer.cancel()
         try:
             super().finish()
         finally:
@@ -569,6 +595,7 @@ def create_http_server(
     max_connections: int = 16,
     connection_slots: threading.BoundedSemaphore | None = None,
     handler_timeout: float = 15,
+    session_timeout: float = 300,
     identity: Identity | None = None,
     device_store: DeviceStateStore | None = None,
     uploads_dir: str = "uploads",
@@ -582,6 +609,7 @@ def create_http_server(
         max_connections=max_connections,
         connection_slots=connection_slots,
         handler_timeout=handler_timeout,
+        session_timeout=session_timeout,
         identity=identity,
         device_store=device_store,
         uploads_dir=uploads_dir,

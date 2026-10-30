@@ -345,8 +345,11 @@ class ServerTestCase(unittest.TestCase):
         address = self.start_server(max_connections=1, timeout=2)
         hold_socket = socket.create_connection(address, timeout=2)
         try:
-            time.sleep(0.1)
-            self.exchange(address, b"@PJL INFO ID\r\n", expect_response=False)
+            hold_socket.sendall(b"@PJL USTATUSOFF\r\n")
+            self.wait_for_event("connection")
+            with socket.create_connection(address, timeout=2) as rejected:
+                rejected.settimeout(2)
+                self.assertEqual(rejected.recv(1), b"")
         finally:
             hold_socket.close()
         self.wait_for_event("connection_limit")

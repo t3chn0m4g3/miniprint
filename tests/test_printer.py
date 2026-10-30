@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pyfakefs import fake_filesystem
 
@@ -37,6 +38,86 @@ class PrinterTestCase(unittest.TestCase):
     def test_echo(self) -> None:
         response = self.printer.command_echo("ECHO DELIMITER20687")
         self.assertEqual(response, b"@PJL ECHO DELIMITER20687\r\n\x0c")
+
+    def test_virtual_files_have_a_cumulative_budget(self) -> None:
+        replies = [
+            self.printer.command_fsdownload(
+                f'FSDOWNLOAD SIZE=32768 NAME="0:/file{i}"\r\n'.encode() + b"x" * 32768
+            )
+            for i in range(10)
+        ]
+        self.assertIn(b"FILEERROR=1", replies[-1])
+        self.assertLessEqual(self.printer.fs.get_disk_usage().used, 262144)
+        self.assertTrue(self.printer.does_path_exist("/file0"))
+        self.assertFalse(self.printer.does_path_exist("/file9"))
+        self.assertEqual(self.handler.records[-1].event, "virtual_state_limit")
+
+    def test_quota_rejection_preserves_existing_file(self) -> None:
+        self.printer.command_fsdownload(b'FSDOWNLOAD SIZE=3 NAME="0:/keep"\r\nold')
+        for i in range(7):
+            self.printer.command_fsdownload(
+                f'FSDOWNLOAD SIZE=32768 NAME="0:/fill{i}"\r\n'.encode() + b"x" * 32768
+            )
+        response = self.printer.command_fsdownload(
+            b'FSDOWNLOAD SIZE=65536 NAME="0:/keep"\r\n' + b"y" * 65536
+        )
+        self.assertIn(b"FILEERROR=1", response)
+        self.assertTrue(self.printer.command_fsupload(b'FSUPLOAD NAME="0:/keep"').endswith(b"old"))
+        self.printer.command_fsdelete(b'FSDELETE NAME="0:/fill0"')
+        self.assertEqual(self.printer.command_fsappend(b'FSAPPEND SIZE=1 NAME="0:/keep"\r\n!'), b"")
+        self.assertTrue(self.printer.command_fsupload(b'FSUPLOAD NAME="0:/keep"').endswith(b"old!"))
+
+    def test_virtual_entry_limit_includes_empty_files_and_directories(self) -> None:
+        for i in range(128):
+            self.printer.command_fsdownload(f'FSDOWNLOAD SIZE=0 NAME="0:/empty{i}"\r\n')
+        response = self.printer.command_fsmkdir('FSMKDIR NAME="0:/overflow"')
+        self.assertIn(b"FILEERROR=1", response)
+        self.assertFalse(self.printer.does_path_exist("/overflow"))
+
+    def test_implicit_directories_cannot_bypass_entry_limit(self) -> None:
+        path = "/".join(["x"] * 129)
+        response = self.printer.command_fsdownload(f'FSDOWNLOAD SIZE=1 NAME="0:/{path}"\r\nx')
+        self.assertIn(b"FILEERROR=1", response)
+        self.assertFalse(self.printer.does_path_exist("/x"))
+
+    def test_virtual_paths_are_bounded(self) -> None:
+        path = "/".join(["a" * 100] * 11)
+        response = self.printer.command_fsmkdir(f'FSMKDIR NAME="0:/{path}"')
+        self.assertIn(b"FILEERROR", response)
+        self.assertFalse(self.printer.does_path_exist("/" + "a" * 100))
+
+    def test_variable_entry_limit_survives_reconnect(self) -> None:
+        for i in range(100):
+            self.printer.command_variable(f"DEFAULT TEST{i}=1")
+        reconnected = Printer(self.logger, upload_dir=self.tmpdir.name, device=self.printer.device)
+        response = reconnected.command_variable("SET OVERFLOW=1")
+        self.assertIn(b"FILEERROR=1", response)
+        self.assertNotIn("OVERFLOW", self.printer.device.variables)
+        self.assertLessEqual(len(self.printer.device.variables), 64)
+        self.assertLessEqual(len(self.printer.device.defaults), 64)
+        self.assertEqual(reconnected.command_variable("SET COPIES=2"), b"")
+
+    def test_variable_byte_limit_rejects_update_atomically(self) -> None:
+        before = self.printer.device.variables.copy()
+        response = self.printer.command_variable("SET COPIES=2 OTHER=" + "x" * 8193)
+        self.assertIn(b"FILEERROR=1", response)
+        self.assertEqual(self.printer.device.variables, before)
+
+    def test_ready_message_is_bounded(self) -> None:
+        response = self.printer.command_rdymsg('RDYMSG DISPLAY="' + "x" * 8193 + '"')
+        self.assertIn(b"FILEERROR=1", response)
+        self.assertEqual(self.printer.ready_msg, "Ready")
+
+    def test_artifact_collision_does_not_follow_symlink(self) -> None:
+        outside = Path(self.tmpdir.name) / "outside"
+        outside.write_bytes(b"keep")
+        (Path(self.tmpdir.name) / "collision.prn").symlink_to(outside)
+        with (
+            patch.object(self.printer, "_artifact_name", return_value="collision.prn"),
+            self.assertRaises(FileExistsError),
+        ):
+            self.printer._save_artifact(".prn", b"replace", "save_print_job")
+        self.assertEqual(outside.read_bytes(), b"keep")
 
     def test_fsdownload_and_query(self) -> None:
         command = (

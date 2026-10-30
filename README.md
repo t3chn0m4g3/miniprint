@@ -52,6 +52,13 @@ Virtual files, variables and ready messages remain available across reconnects
 from the same source IP. This state is held in memory, with a 24-hour idle TTL
 and an LRU limit of 256 sources. Restarting clears it. Commands are synchronized
 per source; `FSINIT` resets only that source's virtual filesystem.
+Each source is limited to 256 KiB of virtual file content (including seed files),
+128 files/directories below the root, and 1024 UTF-8 bytes per normalized path.
+Variables and defaults are each limited to 64 entries and 8192 UTF-8 key/value
+bytes; ready messages are limited to 8192 UTF-8 bytes. Exceeding these budgets
+rejects the command without changing existing state and logs `virtual_state_limit`
+with its `resource`, `size` (when available) and `limit`. These budgets also apply
+after reconnecting; empty files and implicit parent directories count as entries.
 
 ## Protocols and limits
 
@@ -65,12 +72,14 @@ the next UEL (`ESC%-12345X`) or EOF. Other languages use `.prn`. Delimiters may
 cross TCP chunks; binary bodies may contain PJL-like text. A standalone `%!`
 stream is captured as PostScript. Captured artifacts use time/hash filenames,
 never attacker-supplied host paths.
+Files are created exclusively: a filename collision or existing symlink is an
+artifact error, never an overwrite.
 
 | Limit | Default |
 |---|---:|
 | Total concurrent HTTP and PJL connections | 16 |
 | PJL idle timeout (`--timeout`) | 60 s |
-| PJL total deadline (`--session-timeout`) | 300 s |
+| HTTP and PJL total connection deadline (`--session-timeout`) | 300 s |
 | HTTP socket timeout | 15 s |
 | PJL command bytes / ordinary HTTP body (`--max-request-bytes`) | 65,536 |
 | Cumulative print-job bytes / firmware body (`--max-job-bytes`) | 1,048,576 |
@@ -81,6 +90,9 @@ The hard PJL connection byte limit is command bytes plus job bytes. Limit events
 close PJL connections and preserve captured job prefixes. Oversized HTTP bodies
 receive 413. FSUPLOAD returns FILEERROR=1 if the complete reply exceeds the
 response limit, so its advertised SIZE always matches the binary body.
+HTTP's total deadline also covers slow headers, slow bodies and Keep-Alive;
+activity does not renew it. Deadline expiry logs `session_timeout`, closes the
+connection and releases its shared connection slot.
 
 HTTP uses HTTP/1.1, a single persona Server header and device-themed error pages.
 Keep-Alive requests share a connection/session ID.
@@ -159,12 +171,17 @@ its own writable volume; command responses are bytes; virtual paths use
 UID/GID defaults are 2000; persona selection defaults to a persisted random
 choice. Consumers must aggregate by session ID through `session_end`.
 
-The updated ewsposter adapter preserves open sessions across polling runs,
+The proposed ewsposter adapter in
+[telekom-security/ewsposter#18](https://github.com/telekom-security/ewsposter/pull/18)
+preserves open sessions across polling runs,
 deduplicates completed sessions, skips empty connections by default
 (`send_empty_connections = false`) and selects firmware before document before
 raw artifacts. All artifacts are listed in additional data. `size` and `limit`
 are represented by purpose-specific fields such as `artifact_size` and
 `request_too_large_size`.
+It also preserves admin form fields and passback targets, and keeps virtual-state
+limit measurements separate by resource. The PR must be merged and deployed
+before these adapter changes are available in a production ewsposter image.
 
 ## T-Pot integration
 

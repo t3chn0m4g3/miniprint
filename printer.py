@@ -28,6 +28,11 @@ from personas import PERSONAS, Identity, Persona, new_identity
 DEFAULT_MAX_JOB_BYTES = 1 * 1024 * 1024
 DEFAULT_MAX_RESPONSE_BYTES = 128 * 1024
 DEFAULT_MAX_VIRTUAL_FILE_BYTES = 256 * 1024
+MAX_VIRTUAL_BYTES = 256 * 1024
+MAX_VIRTUAL_ENTRIES = 128
+MAX_VIRTUAL_PATH_BYTES = 1024
+MAX_VARIABLES = 64
+MAX_VARIABLE_BYTES = 8192
 PJL_FILE_NOT_FOUND = "FILEERROR=3\r\n"
 PJL_BAD_REQUEST = "FILEERROR=2\r\n"
 RESET_SEQUENCE = b"\x1b%-12345X"
@@ -82,7 +87,7 @@ class Printer:
         self.device.ready_msg = value
 
     def reset_virtual_filesystem(self) -> None:
-        self.fs = fake_filesystem.FakeFilesystem()
+        self.fs = fake_filesystem.FakeFilesystem(total_size=MAX_VIRTUAL_BYTES)
         self.device.fs = self.fs
         self.fos = fake_filesystem.FakeOsModule(self.fs)
         self._seed_filesystem()
@@ -150,7 +155,7 @@ class Printer:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         filename = self._artifact_name(suffix, data)
         path = self.upload_dir / filename
-        with path.open("wb") as handle:
+        with path.open("xb") as handle:
             handle.write(data)
         self.logger.info(
             "Saved print artifact",
@@ -226,6 +231,12 @@ class Printer:
             return None
         cleaned = cleaned.replace("\\", "/")
         normalized = posixpath.normpath("/" + cleaned.lstrip("/"))
+        if len(normalized.encode("utf-8")) > MAX_VIRTUAL_PATH_BYTES:
+            self.logger.warning(
+                "Virtual path exceeded configured limit",
+                extra={"event": "virtual_state_limit", "resource": "path_bytes", "limit": MAX_VIRTUAL_PATH_BYTES},
+            )
+            return None
         if normalized == "/.":
             return "/"
         return normalized
@@ -233,6 +244,27 @@ class Printer:
     def does_path_exist(self, path: str) -> bool:
         normalized = self.normalize_device_path(path)
         return bool(normalized and self.fos.path.exists(normalized))
+
+    def _state_limit(self, command: str, resource: str, size: int, limit: int) -> bytes:
+        self.logger.warning(
+            "Rejected persistent virtual state above configured limit",
+            extra={"event": "virtual_state_limit", "command": command, "resource": resource, "size": size, "limit": limit},
+        )
+        return self._response(f"@PJL {command} FILEERROR=1\r\n")
+
+    def _filesystem_limit(self, command: str, path: str, size: int = 0) -> bytes | None:
+        previous_size = self.fos.stat(path).st_size if self.fos.path.isfile(path) else 0
+        total_size = self.fs.get_disk_usage().used - previous_size + size
+        if total_size > MAX_VIRTUAL_BYTES:
+            return self._state_limit(command, "filesystem_bytes", total_size, MAX_VIRTUAL_BYTES)
+        entries = sum(len(dirs) + len(files) for _, dirs, files in self.fos.walk("/"))
+        missing = path
+        while not self.fos.path.exists(missing):
+            entries += 1
+            missing = posixpath.dirname(missing)
+        if entries > MAX_VIRTUAL_ENTRIES:
+            return self._state_limit(command, "filesystem_entries", entries, MAX_VIRTUAL_ENTRIES)
+        return None
 
     def append_raw_print_job(self, data: bytes | str) -> bytes:
         raw = self._as_bytes(data)
@@ -319,6 +351,8 @@ class Printer:
             )
             return self._response(f"@PJL FSDOWNLOAD NAME={self.format_device_name(file_name)} FILEERROR=1\r\n")
 
+        if (limited := self._filesystem_limit("FSDOWNLOAD", file_name, len(file_bytes))) is not None:
+            return limited
         if self.fos.path.exists(file_name) and self.fos.path.isfile(file_name):
             self.fos.remove(file_name)
         try:
@@ -377,6 +411,8 @@ class Printer:
             )
             return self._response(f"@PJL FSAPPEND NAME={self.format_device_name(file_name)} FILEERROR=1\r\n")
 
+        if (limited := self._filesystem_limit("FSAPPEND", file_name, total_size)) is not None:
+            return limited
         try:
             file_module = fake_filesystem.FakeFileOpen(self.fs)
             with file_module(file_name, mode) as handle:
@@ -441,6 +477,8 @@ class Printer:
             extra={"action": "request", "event": "fsmkdir", "virtual_path": requested_dir},
         )
         if not self.fos.path.exists(requested_dir):
+            if (limited := self._filesystem_limit("FSMKDIR", requested_dir)) is not None:
+                return limited
             self.fs.create_dir(requested_dir)
         return b""
 
@@ -579,6 +617,14 @@ class Printer:
                     },
                 )
                 raise RebootRequested()
+        stores = (self.device.variables, self.device.defaults) if command == "DEFAULT" else (self.device.variables,)
+        for store in stores:
+            updated = store | params
+            if len(updated) > MAX_VARIABLES:
+                return self._state_limit(command, "variable_entries", len(updated), MAX_VARIABLES)
+            size = sum(len(key.encode("utf-8")) + len(val.encode("utf-8")) for key, val in updated.items())
+            if size > MAX_VARIABLE_BYTES:
+                return self._state_limit(command, "variable_bytes", size, MAX_VARIABLE_BYTES)
         for key, val in params.items():
             self.device.variables[key] = val
             if command == "DEFAULT":
@@ -603,6 +649,9 @@ class Printer:
         rdymsg = request_parameters.get("DISPLAY")
         if rdymsg is None:
             return self._response(f"@PJL RDYMSG {PJL_BAD_REQUEST}")
+        size = len(rdymsg.encode("utf-8"))
+        if size > MAX_VARIABLE_BYTES:
+            return self._state_limit("RDYMSG", "ready_message_bytes", size, MAX_VARIABLE_BYTES)
         self.ready_msg = rdymsg
         self.logger.info(
             "Ready message changed",
